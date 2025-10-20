@@ -1,250 +1,180 @@
+# -*- coding: utf-8 -*-
+# Stock Signal Bot (Polygon Free plan: previous market day)
+# - Pulls grouped aggs of the most recent trading day (yesterday or earlier if weekend)
+# - Filters by % change, price, volume
+# - Sends summary to Telegram
+# - Runs periodically to avoid spamming free API
+
 import os
 import time
+import json
 import requests
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 
-from flask import Flask
+# ========= ENV (Render → Environment Variables) =========
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+CHAT_ID = os.environ.get("CHAT_ID", "").strip()
+POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "").strip()
 
-# === ENV (ต้องตั้งใน Render) ===
-BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHAT_ID = os.environ["CHAT_ID"]
-POLYGON_API_KEY = os.environ["POLYGON_API_KEY"]
+# ========= BASIC SETTINGS (ปรับได้ตามชอบ) =========
+CHECK_INTERVAL_SEC = int(os.environ.get("CHECK_INTERVAL_SEC", "1800"))  # เช็คทุก 30 นาที
+ALERT_PCT = float(os.environ.get("ALERT_PCT", "10"))       # % เปลี่ยนแปลงขั้นต่ำ
+MIN_PRICE = float(os.environ.get("MIN_PRICE", "0.30"))      # กันหุ้นถูกจัด
+MIN_VOLUME = int(os.environ.get("MIN_VOLUME", "0"))         # ถ้าจะกรอง volume ใส่ค่าที่นี่ (เช่น 300000)
+INCLUDE_LOSERS = os.environ.get("INCLUDE_LOSERS", "false").lower() == "true"  # แจ้งฝั่งลงด้วยไหม
 
-# === CONFIG (ปรับได้) ===
-CHECK_INTERVAL_SEC = 60          # สแกนทุก X วิ
-ALERT_PCT = 12.0                 # เกณฑ์ % เปลี่ยนขั้นต่ำ (แนะนำเริ่ม 10–15)
-MIN_PRICE = 1.0                  # ราคาอย่างน้อย
-INCLUDE_LOSERS = True            # แจ้งขาลงด้วยไหม
-HEARTBEAT_INTERVAL = 1800        # heartbeat ทุก 30 นาที
-SUMMARY_INTERVAL = 3600          # summary ทุก 60 นาที
-SESSION_MODE = "extended"        # สำหรับแสดงในข้อความ
-
-last_heartbeat = 0
-last_summary = 0
-
-# === Telegram ===
+# ========= SMALL UTILS =========
 def tg(text: str):
+    """Send a Telegram text message."""
+    if not (BOT_TOKEN and CHAT_ID):
+        print("Telegram env missing.")
+        return
     try:
-        requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": text},
-            timeout=10
-        )
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": CHAT_ID, "text": text}
+        r = requests.post(url, json=payload, timeout=20)
+        print("TG send:", r.status_code, r.text[:200])
     except Exception as e:
-        print("Telegram send error:", e)
+        print("TG error:", e)
 
-# === Helpers ===
-def now_str():
-    return datetime.now().strftime("%H:%M:%S")
+def eastern_today_date():
+    """
+    ประมาณวันที่ปัจจุบันในโซนเวลานิวยอร์ก (EST/EDT)
+    ใช้ UTC-4 เป็นค่าใกล้เคียง (พอเพียงสำหรับการดึง 'วันก่อนหน้า')
+    """
+    return (datetime.utcnow() - timedelta(hours=4)).date()
 
-def us_latest_trading_date_iso():
-    # ใช้ UTC เป็นฐาน: ถ้าวันหยุดเสาร์-อาทิตย์ ให้ถอยไปวันศุกร์
-    d = datetime.utcnow().date()
-    while d.weekday() >= 5:  # 5=Sat,6=Sun
+def prev_market_day():
+    """คืนค่า 'วันทำการล่าสุด' ก่อนวันนี้ (เลี่ยงเสาร์/อาทิตย์)"""
+    d = eastern_today_date() - timedelta(days=1)
+    while d.weekday() >= 5:  # 5=Sat, 6=Sun
         d -= timedelta(days=1)
-    return d.isoformat()
+    return d
 
-def _get(url, params=None, timeout=12):
-    p = params.copy() if isinstance(params, dict) else {}
-    p["apiKey"] = POLYGON_API_KEY
-    r = requests.get(url, params=p, timeout=timeout)
-    return r
-
-# === Primary: snapshot (intraday), Fallback: grouped aggs (daily) ===
-def fetch_snapshot(kind="gainers"):
-    """return list of tuples (sym, pct, price, vol) from snapshot; raise for_status"""
-    url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/{kind}"
-    r = _get(url)
-    print("snapshot", kind, r.status_code)
-    r.raise_for_status()
-    data = r.json() or {}
-    rows = data.get("tickers") or []
-    out = []
-    for d in rows:
-        sym = d.get("ticker")
-        pct = d.get("todaysChangePerc")
-        price = (d.get("lastTrade") or {}).get("p") or (d.get("day") or {}).get("c")
-        vol = (d.get("day") or {}).get("v")
-        if sym is None or pct is None or price is None:
-            continue
-        out.append((sym, float(pct), float(price), float(vol or 0)))
-    return out
-
-def fetch_grouped(date_iso=None):
-    """return list of tuples (sym, pct, price, vol) using grouped aggs (O/C/V)"""
-    if not date_iso:
-        date_iso = us_latest_trading_date_iso()
-    url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{date_iso}"
-    r = _get(url, params={"adjusted": "true"}, timeout=20)
-    print("grouped", date_iso, r.status_code)
-    r.raise_for_status()
-    data = r.json() or {}
-    results = data.get("results") or []
-    out = []
-    for it in results:
-        sym = it.get("T")
-        o = it.get("o"); c = it.get("c"); v = it.get("v")
-        if not sym or o is None or c is None:
-            continue
-        try:
-            pct = (float(c) - float(o)) / float(o) * 100.0
-            out.append((sym, pct, float(c), float(v or 0)))
-        except:
-            continue
-    return out
-
-def fetch_movers_resilient():
-    """ดึง gainers/losers แบบทนทาน: snapshot -> (ถ้าไม่ได้) ใช้ grouped"""
-    movers = []
-    used = "snapshot"
+def fetch_grouped_aggs(day):
+    """เรียก grouped aggs ของวันทำการที่ระบุ (ฟรีได้)"""
+    date_str = day.isoformat()
+    url = (
+        f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/"
+        f"{date_str}?adjusted=true&apiKey={POLYGON_API_KEY}"
+    )
+    r = requests.get(url, timeout=60)
+    print("Polygon grouped:", r.status_code)
     try:
-        g = fetch_snapshot("gainers")
-        movers.extend(g)
-        if INCLUDE_LOSERS:
-            l = fetch_snapshot("losers")
-            movers.extend(l)
-    except requests.HTTPError as e:
-        code = getattr(e.response, "status_code", None)
-        print("snapshot HTTPError:", code)
-        used = "grouped"
-        rows = fetch_grouped()
-        # จัดอันดับ: บวกมากสุดเป็น gainers, ลบน้อยสุดเป็น losers
-        rows_sorted = sorted(rows, key=lambda x: x[1], reverse=True)
-        top_g = rows_sorted[:50]
-        top_l = rows_sorted[-50:] if INCLUDE_LOSERS else []
-        movers = top_g + top_l
-    except Exception as e:
-        print("snapshot error:", e)
-        used = "grouped"
-        rows = fetch_grouped()
-        rows_sorted = sorted(rows, key=lambda x: x[1], reverse=True)
-        top_g = rows_sorted[:50]
-        top_l = rows_sorted[-50:] if INCLUDE_LOSERS else []
-        movers = top_g + top_l
-
-    print(f"movers source = {used} | count = {len(movers)}")
-    return movers, used
-
-# === Summary text ===
-def fmt_row(rank, sym, pct, price, vol):
-    return f"{rank}. {sym}  {pct:+.1f}%  (${price:.2f})  Vol {int(vol):,}"
-
-def build_hourly_summary():
-    gainers, used1 = [], ""
-    losers, used2 = [], ""
-
-    try:
-        g = fetch_snapshot("gainers")
-        gainers = g[:10]
-        used1 = "snapshot"
+        data = r.json()
     except Exception:
-        rows = fetch_grouped()
-        rows_sorted = sorted(rows, key=lambda x: x[1], reverse=True)
-        gainers = rows_sorted[:10]
-        used1 = "grouped"
+        data = {"status": "ERR", "message": "invalid json", "raw": r.text[:300]}
+    return data
 
-    if INCLUDE_LOSERS:
+def analyze(results):
+    """
+    แปลงข้อมูลเป็นลิสต์ของสัญลักษณ์ที่ผ่านเกณฑ์
+    โครงสร้าง object ที่ Polygon ส่งกลับ (สำคัญ ๆ):
+      T=ticker, o=open, c=close, v=volume, h=high, l=low
+    """
+    movers_up = []
+    movers_dn = []
+
+    for it in results or []:
         try:
-            l = fetch_snapshot("losers")
-            losers = l[:10]
-            used2 = "snapshot"
+            sym = it.get("T")
+            o = float(it.get("o", 0) or 0)
+            c = float(it.get("c", 0) or 0)
+            v = int(it.get("v", 0) or 0)
+            if not sym or o <= 0:
+                continue
+            price = c
+            pct = (c - o) / o * 100.0
+
+            # basic filters
+            if price < MIN_PRICE:
+                continue
+            if v < MIN_VOLUME:
+                continue
+
+            rec = {
+                "sym": sym,
+                "price": price,
+                "pct": pct,
+                "vol": v,
+                "open": o,
+                "close": c
+            }
+            if pct >= ALERT_PCT:
+                movers_up.append(rec)
+            elif INCLUDE_LOSERS and (-pct) >= ALERT_PCT:
+                movers_dn.append(rec)
         except Exception:
-            rows = fetch_grouped()
-            rows_sorted = sorted(rows, key=lambda x: x[1])
-            losers = rows_sorted[:10]
-            used2 = "grouped"
+            continue
 
-    lines = [f"🧾 Hourly Summary ({now_str()})"]
-    if gainers:
-        lines.append(f"\nTop Gainers (src: {used1}):")
-        for i, (sym, pct, price, vol) in enumerate(sorted(gainers, key=lambda x: x[1], reverse=True)[:3], 1):
-            lines.append(fmt_row(i, sym, pct, price, vol))
-    else:
-        lines.append("\nTop Gainers: -")
+    # จัดอันดับ
+    movers_up.sort(key=lambda x: x["pct"], reverse=True)
+    movers_dn.sort(key=lambda x: x["pct"], reverse=True)  # (ค่านี้จะเป็นขาลง มีค่าเป็นลบ)
 
-    if INCLUDE_LOSERS:
-        if losers:
-            lines.append(f"\nTop Losers (src: {used2}):")
-            for i, (sym, pct, price, vol) in enumerate(sorted(losers, key=lambda x: x[1])[:3], 1):
-                lines.append(fmt_row(i, sym, pct, price, vol))
-        else:
-            lines.append("\nTop Losers: -")
+    return movers_up, movers_dn
 
+def fmt_list(items, label, limit=20):
+    if not items:
+        return f"• ไม่มี {label} ผ่านเกณฑ์"
+    lines = [f"• {x['sym']}  {x['pct']:+.1f}%  @{x['price']:.2f}  Vol:{x['vol']:,}" for x in items[:limit]]
     return "\n".join(lines)
 
-# === MAIN LOOP ===
-def main():
-    tg(
-        "✅ Bot started & scanning now\n"
-        f"• Mode: {SESSION_MODE}\n"
-        f"• Alert ≥ {ALERT_PCT:.1f}% | Min Price ≥ ${MIN_PRICE:.2f}\n"
-        f"• Include Losers: {INCLUDE_LOSERS}\n"
-        f"• Interval: {CHECK_INTERVAL_SEC}s"
-    )
+def run_once():
+    if not POLYGON_API_KEY:
+        tg("❌ ไม่พบ POLYGON_API_KEY ใน Environment Variables")
+        return
 
-    last_alert_time = {}
-    global last_heartbeat, last_summary
+    mday = prev_market_day()
+    data = fetch_grouped_aggs(mday)
 
-    while True:
-        try:
-            movers, source = fetch_movers_resilient()  # list of (sym, pct, price, vol)
+    status = data.get("status", "")
+    if status != "OK":
+        # ข้อความผิดพลาดของเรทฟรี ขอวันนี้จะขึ้น NOT_AUTHORIZED
+        msg = data.get("message", str(data)[:300])
+        tg(f"⚠️ Polygon (free) ปฏิเสธคำขอ\nวันที่: {mday.isoformat()}\nstatus: {status}\nmessage: {msg}")
+        return
 
-            hits = 0
-            for sym, pct, price, vol in movers:
-                # กรองเบื้องต้น
-                if price is None or price < MIN_PRICE:
-                    continue
-                if pct is None or abs(pct) < ALERT_PCT:
-                    continue
-                # กันสแปมซ้ำ 60 นาที
-                now_ts = time.time()
-                if sym in last_alert_time and now_ts - last_alert_time[sym] < 3600:
-                    continue
-                last_alert_time[sym] = now_ts
+    results = data.get("results", [])
+    up, dn = analyze(results)
 
-                label = "🟢 GAIN" if pct >= 0 else "🔴 LOSS"
-                msg = (
-                    f"{label} {sym}\n"
-                    f"Change: {pct:+.1f}% | Price: ${price:.2f}\n"
-                    f"Volume: {int(vol):,}\n"
-                    f"Source: {source}\n"
-                    f"Time: {now_str()}"
-                )
-                tg(msg)
-                hits += 1
+    header = f"✅ Top Movers (ฟรี, ย้อนหลังวันล่าสุด)\nวันที่อ้างอิง: {mday.isoformat()}\nเกณฑ์: ≥{ALERT_PCT:.1f}% | ราคา ≥{MIN_PRICE} | Vol ≥{MIN_VOLUME:,}\n"
+    body_up = "📈 ขึ้นแรง:\n" + fmt_list(up, "ขึ้น")
+    if INCLUDE_LOSERS:
+        body_dn = "\n\n📉 ลงแรง:\n" + fmt_list(dn, "ลง")
+    else:
+        body_dn = ""
+    tg(header + "\n" + body_up + body_dn)
 
-            print(f"[{now_str()}] hits: {hits}")
-
-            # Heartbeat
-            now = time.time()
-            if now - last_heartbeat >= HEARTBEAT_INTERVAL:
-                tg(f"💓 Heartbeat — bot still running at {now_str()}")
-                last_heartbeat = now
-
-            # Hourly Summary
-            if now - last_summary >= SUMMARY_INTERVAL:
-                try:
-                    tg(build_hourly_summary())
-                except Exception as e:
-                    print("Summary error:", e)
-                last_summary = now
-
-        except Exception as e:
-            print("Loop error:", e)
-            tg(f"❗Scanner error: {e}")
-
-        time.sleep(CHECK_INTERVAL_SEC)
-
-# === Flask (ให้ Render/uptime เช็กพอร์ต) ===
+# ========= Flask (ให้ UptimeRobot เคาะ) =========
+from flask import Flask
 app = Flask(__name__)
 
-@app.route('/')
+@app.route("/")
 def home():
-    return "Bot is running fine."
+    return "Bot (Polygon Free) is running. Last market day: " + prev_market_day().isoformat()
+
+def main_loop():
+    # ส่งทันทีรอบแรก
+    try:
+        tg("🟢 เริ่มทำงานโหมดฟรี (ดึงข้อมูลวันทำการล่าสุดจาก Polygon)")
+        run_once()
+    except Exception as e:
+        tg(f"❗ Startup error: {e}")
+
+    # วนรอบแบบประหยัด API
+    while True:
+        try:
+            time.sleep(CHECK_INTERVAL_SEC)
+            run_once()
+        except Exception as e:
+            print("Loop error:", e)
+            tg(f"❗ Loop error: {e}")
+            time.sleep(60)
 
 if __name__ == "__main__":
+    # รัน main loop แบบ background ด้วยวิธีง่าย ๆ (ไม่ใช้ thread แยกเพราะ Render ฟรีโอเคกับลูปยาว)
+    # แล้วเปิดเว็บเซิร์ฟเวอร์ทิ้งไว้ให้ UptimeRobot เคาะ
     import threading
-    threading.Thread(target=main, daemon=True).start()
-    # Render จะกำหนด PORT ให้ใน env; ถ้าไม่มี ให้ใช้ 10000
-    port = int(os.environ.get("PORT", "10000"))
-    app.run(host="0.0.0.0", port=port)
+    t = threading.Thread(target=main_loop, daemon=True)
+    t.start()
+    app.run(host="0.0.0.0", port=10000)
