@@ -1,194 +1,276 @@
 # -*- coding: utf-8 -*-
-# Stock Signal Bot (Render Web Service + Telegram Alert)
-# - สแกน Top Movers จาก Polygon
-# - ส่งแจ้งเตือนเข้า Telegram
-# - เปิด Flask หน้า "/" สำหรับ Render/UptimeRobot ให้ออนไลน์ตลอด
+# Stock-signal-bot (Render/Telegram/Polygon)
+# - โปรไฟล์สำเร็จรูป (conservative/balanced/momentum/reversal)
+# - สัญญาณเตรียมเข้า Options: CALL/PUT
+# - กรองคุณภาพเบื้องต้น (ราคา/วอลุ่ม)
+# - กันสแปมสัญญาณซ้ำด้วย REPEAT_AFTER_MIN
+# - Flask keepalive สำหรับ Render (พอร์ตอ่านจาก PORT หรือ 10000)
 
 import os
 import time
+import json
 import requests
 from datetime import datetime, timedelta
-from threading import Thread
 from flask import Flask
 
-# ========== ค่า Environment (ต้องใส่ใน Render -> Environment Variables) ==========
-BOT_TOKEN        = os.environ["BOT_TOKEN"]          # เช่น 8085xxxx:AA....
-CHAT_ID          = os.environ["CHAT_ID"]            # เช่น 5263482152
-POLYGON_API_KEY  = os.environ["POLYGON_API_KEY"]    # เช่น BqQ5kLFE0m...
+# ========= ENV (ต้องตั้งใน Render: Environment Variables) =========
+BOT_TOKEN        = os.environ.get("BOT_TOKEN", "").strip()
+CHAT_ID          = os.environ.get("CHAT_ID", "").strip()
+POLYGON_API_KEY  = os.environ.get("POLYGON_API_KEY", "").strip()
 
-# ========== การตั้งค่า (ปรับได้ตลอด) ==========
-CHECK_INTERVAL_SEC = 60         # สแกนทุกกี่วินาที
-ALERT_PCT          = 15.0       # เปอร์เซ็นต์เปลี่ยนแปลงขั้นต่ำถึงจะเตือน (ขึ้น)
-INCLUDE_LOSERS     = False      # แจ้งฝั่งลงด้วยหรือไม่
-MIN_PRICE          = 0.30       # กรองหุ้นราคาต่ำเกินไป
-MIN_VOLUME         = 0          # กรอง Volume (0 = ไม่กรอง)
-REPEAT_AFTER_MIN   = 60         # เตือนซ้ำชื่อเดิมได้อีกครั้งหลัง X นาที
-SESSION_MODE       = "extended" # "regular" หรือ "extended" (ไว้แสดงในข้อความ)
+# ========= โปรไฟล์ให้เลือก (ตั้งค่าเดียวพอ) =========
+PROFILE = "balanced"  # เลือก: "conservative" / "balanced" / "momentum" / "reversal"
 
-# ========== ฟังก์ชันส่งข้อความ Telegram ==========
+_profiles = {
+    # เน้นคุณภาพ กรองหนัก
+    "conservative": dict(
+        CHECK_INTERVAL_SEC=90,
+        ALERT_PCT=20.0,
+        INCLUDE_LOSERS=True,
+        MIN_PRICE=5.0,
+        MIN_VOLUME=500_000,
+        REPEAT_AFTER_MIN=90,
+        SESSION_MODE="extended",
+        CALL_PCT=7.0,
+        PUT_PCT=-7.0,
+        MIN_OPTION_PRICE=5.0,
+        SEND_DAILY_SUMMARY=True, SUMMARY_HOUR=8, SUMMARY_MINUTE=0,
+        WHITELIST=[],
+    ),
+    # สมดุล (แนะนำเริ่มต้น)
+    "balanced": dict(
+        CHECK_INTERVAL_SEC=60,
+        ALERT_PCT=15.0,
+        INCLUDE_LOSERS=True,
+        MIN_PRICE=2.0,
+        MIN_VOLUME=200_000,
+        REPEAT_AFTER_MIN=60,
+        SESSION_MODE="extended",
+        CALL_PCT=5.0,
+        PUT_PCT=-5.0,
+        MIN_OPTION_PRICE=1.0,
+        SEND_DAILY_SUMMARY=True, SUMMARY_HOUR=8, SUMMARY_MINUTE=0,
+        WHITELIST=[],
+    ),
+    # โมเมนตัมแรง (หาเบรคเอาต์)
+    "momentum": dict(
+        CHECK_INTERVAL_SEC=45,
+        ALERT_PCT=10.0,
+        INCLUDE_LOSERS=True,
+        MIN_PRICE=1.0,
+        MIN_VOLUME=100_000,
+        REPEAT_AFTER_MIN=45,
+        SESSION_MODE="extended",
+        CALL_PCT=4.0,
+        PUT_PCT=-4.0,
+        MIN_OPTION_PRICE=1.0,
+        SEND_DAILY_SUMMARY=True, SUMMARY_HOUR=8, SUMMARY_MINUTE=0,
+        WHITELIST=[],
+    ),
+    # จับรีเวอร์ส/สวิงแรง (เสี่ยงสูงกว่า)
+    "reversal": dict(
+        CHECK_INTERVAL_SEC=60,
+        ALERT_PCT=12.0,
+        INCLUDE_LOSERS=True,
+        MIN_PRICE=1.0,
+        MIN_VOLUME=150_000,
+        REPEAT_AFTER_MIN=60,
+        SESSION_MODE="extended",
+        CALL_PCT=3.5,
+        PUT_PCT=-3.5,
+        MIN_OPTION_PRICE=1.0,
+        SEND_DAILY_SUMMARY=True, SUMMARY_HOUR=8, SUMMARY_MINUTE=0,
+        WHITELIST=[],
+    ),
+}
+cfg = _profiles[PROFILE]
+
+CHECK_INTERVAL_SEC = cfg["CHECK_INTERVAL_SEC"]
+ALERT_PCT          = cfg["ALERT_PCT"]
+INCLUDE_LOSERS     = cfg["INCLUDE_LOSERS"]
+MIN_PRICE          = cfg["MIN_PRICE"]
+MIN_VOLUME         = cfg["MIN_VOLUME"]
+REPEAT_AFTER_MIN   = cfg["REPEAT_AFTER_MIN"]
+SESSION_MODE       = cfg["SESSION_MODE"]
+CALL_PCT           = cfg["CALL_PCT"]
+PUT_PCT            = cfg["PUT_PCT"]
+MIN_OPTION_PRICE   = cfg["MIN_OPTION_PRICE"]
+SEND_DAILY_SUMMARY = cfg["SEND_DAILY_SUMMARY"]
+SUMMARY_HOUR       = cfg["SUMMARY_HOUR"]
+SUMMARY_MINUTE     = cfg["SUMMARY_MINUTE"]
+WHITELIST          = set([s.upper() for s in cfg["WHITELIST"]])
+
+# ========= Utils =========
 def tg(text: str):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    """ส่งข้อความเข้า Telegram"""
+    if not BOT_TOKEN or not CHAT_ID:
+        print("Telegram not configured.")
+        return
     try:
-        r = requests.post(url, json={
-            "chat_id": CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True
-        }, timeout=15)
-        if r.status_code >= 400:
-            print("TG send error:", r.status_code, r.text)
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": CHAT_ID, "text": text}
+        r = requests.post(url, json=payload, timeout=15)
+        if r.status_code != 200:
+            print("TG send:", r.status_code, r.text[:200])
     except Exception as e:
-        print("TG exception:", e)
+        print("TG error:", e)
 
-# ========== ดึง Top Movers จาก Polygon ==========
-# หมายเหตุ: ใช้ snapshot gainers/losers
-# เอกสามารถปรับ endpoint เพิ่มได้ภายหลังตามต้องการ
-def fetch_movers(kind="gainers"):
+def label_session():
+    """ป้ายบอกช่วงตลาด (แบบง่าย ๆ)"""
+    # แค่เป็นข้อความประกอบ ไม่ผูกกับ timezone ตลาดจริง
+    return {
+        "extended": "🟢 Live / 🟡 Pre / 🔵 After",
+        "regular":  "🟢 Live only",
+    }.get(SESSION_MODE, "🟢 Live")
+
+def option_tag(pct: float, last_price: float):
     """
-    kind: "gainers" หรือ "losers"
-    return: list[dict] -> [{sym, price, pct, volume}]
+    ข้อเสนอไอเดีย Options คร่าว ๆ จาก % เปลี่ยนแปลง และราคาหุ้น
+    - CALL เมื่อ pct >= CALL_PCT และราคาหุ้น >= MIN_OPTION_PRICE
+    - PUT  เมื่อ pct <= PUT_PCT  และราคาหุ้น >= MIN_OPTION_PRICE
     """
-    assert kind in ("gainers", "losers")
+    if last_price is None:
+        return ""
+    if last_price < MIN_OPTION_PRICE:
+        return ""  # หุ้นเล็กราคาเตี้ย ไม่แนะนำออปชั่น
+    if pct is None:
+        return ""
+    if pct >= CALL_PCT:
+        return " | Options idea: CALL 📈"
+    if pct <= PUT_PCT:
+        return " | Options idea: PUT 📉"
+    return ""
 
-    url = f"https://api.polygon.io/v2/snapshot/locale/us/markets/stocks/{kind}"
-    params = {"apiKey": POLYGON_API_KEY}
-
+def _fmt_num(x):
     try:
-        r = requests.get(url, params=params, timeout=20)
-        if r.status_code == 403:
-            # API Key/สิทธิ์ไม่พอ
-            print("Polygon 403 Forbidden:", r.text)
-            return []
-        r.raise_for_status()
-        data = r.json()
-    except Exception as e:
-        print("Polygon request error:", e)
-        return []
+        return f"{x:,.0f}"
+    except:
+        return str(x)
 
-    items = []
-    for t in (data.get("tickers") or []):
-        sym = t.get("ticker") or "-"
-        # ราคาสุดท้าย
-        price = None
-        last_trade = t.get("lastTrade") or {}
-        if isinstance(last_trade, dict):
-            price = last_trade.get("p")
-        if price is None:
-            # บางเคสไม่มี lastTrade ให้ลองเอาราคาอื่น ๆ
-            price = (t.get("day") or {}).get("c") or (t.get("prevDay") or {}).get("c") or 0.0
+def now_str():
+    return datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
 
-        # % เปลี่ยนแปลงวันนี้
-        pct = t.get("todaysChangePerc")
-        if pct is None:
-            day = t.get("day") or {}
-            prev = (t.get("prevDay") or {}).get("c")
-            cur = day.get("c")
-            if prev and cur:
-                try:
-                    pct = (cur - prev) / prev * 100.0
-                except Exception:
-                    pct = 0.0
-            else:
-                pct = 0.0
+# ========= Polygon fetchers =========
+BASE = "https://api.polygon.io/v2/snapshot/locale/us/markets/stocks"
 
-        # ปริมาณ
-        volume = (t.get("day") or {}).get("v") or 0
+def fetch_movers(side="gainers"):
+    """
+    ดึง Top gainers/losers จาก Polygon
+    โครงสร้างที่ใช้: item["ticker"], item["todaysChangePerc"], item.get("lastTrade",{}).get("p"), item.get("day",{}).get("v")
+    """
+    url = f"{BASE}/{side}?apiKey={POLYGON_API_KEY}"
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+    data = r.json()
+    results = data.get("tickers", []) or []
+    out = []
+    for it in results:
+        sym = it.get("ticker")
+        pct = it.get("todaysChangePerc")
+        last_price = None
+        vol = None
+        try:
+            last_price = it.get("lastTrade", {}).get("p", None)
+        except:
+            pass
+        try:
+            vol = it.get("day", {}).get("v", None)
+        except:
+            pass
+        out.append((sym, last_price, pct, vol))
+    return out
 
-        items.append({
-            "sym": sym,
-            "price": float(price or 0),
-            "pct": float(pct or 0),
-            "volume": int(volume or 0),
-        })
-
-    return items
-
-# ========== ตัวช่วยกรอง & ฟอร์แมตข้อความ ==========
-def pass_filters(row: dict, up: bool):
-    # กรองราคา
-    if row["price"] < MIN_PRICE:
-        return False
-    # กรอง volume
-    if MIN_VOLUME and row["volume"] < MIN_VOLUME:
-        return False
-    # กรอง % เปลี่ยน
-    if up:
-        return row["pct"] >= ALERT_PCT
-    else:
-        return abs(row["pct"]) >= ALERT_PCT
-
-def fmt_row(label: str, row: dict):
-    return (
-        f"{label} ⚡ <b>{row['sym']}</b>\n"
-        f"+{row['pct']:.1f}% | ${row['price']:.2f}\n"
-        f"Vol: {row['volume']:,}\n"
-        f"<i>mode: {SESSION_MODE} • {datetime.now().strftime('%H:%M:%S')}</i>"
-    )
-
-def fmt_row_down(label: str, row: dict):
-    return (
-        f"{label} 🔻 <b>{row['sym']}</b>\n"
-        f"{row['pct']:.1f}% | ${row['price']:.2f}\n"
-        f"Vol: {row['volume']:,}\n"
-        f"<i>mode: {SESSION_MODE} • {datetime.now().strftime('%H:%M:%S')}</i>"
-    )
-
-# ========== งานหลัก ==========
+# ========= Core scan loop =========
 def main():
-    tg(f"✅ เริ่มสแกน Top Movers (≥{ALERT_PCT:.1f}% | mode: {SESSION_MODE})")
-    last_alert_time = {}  # sym -> datetime ล่าสุดที่เตือน
+    tg(f"✅ เริ่มสแกน Top Movers (≥{ALERT_PCT:.1f}% | mode: {SESSION_MODE})\n{label_session()}")
+    last_alert_time = {}  # sym -> datetime
 
     while True:
         try:
-            # ฝั่งขึ้น
-            ups = fetch_movers("gainers")
+            # ---- ดึงข้อมูลจาก Polygon
+            movers = []
+            try:
+                g = fetch_movers("gainers")
+                movers.extend(g)
+            except Exception as e:
+                print("Polygon gainers error:", e)
+
+            if INCLUDE_LOSERS:
+                try:
+                    l = fetch_movers("losers")
+                    movers.extend(l)
+                except Exception as e:
+                    print("Polygon losers error:", e)
+
+            # ---- กรองคุณภาพ & ส่งสัญญาณ
             hits = 0
-            for row in ups:
-                if not pass_filters(row, up=True):
+            for sym, price, pct, vol in movers:
+                if not sym:
                     continue
-                sym = row["sym"]
-                # กันสแปม: เตือนซ้ำได้หลัง X นาที
-                tlast = last_alert_time.get(sym)
-                if tlast and datetime.now() - tlast < timedelta(minutes=REPEAT_AFTER_MIN):
+                u_sym = sym.upper()
+
+                # whitelist (ถ้าใส่มา)
+                if WHITELIST and u_sym not in WHITELIST:
                     continue
-                tg(fmt_row("Gainer", row))
-                last_alert_time[sym] = datetime.now()
+
+                # กรองราคา/วอลุ่ม
+                if price is None or price < MIN_PRICE:
+                    continue
+                if vol is not None and vol < MIN_VOLUME:
+                    continue
+
+                # เกณฑ์ % เปลี่ยนแปลง
+                if pct is None:
+                    continue
+                if abs(pct) < ALERT_PCT:
+                    continue
+
+                # กันสแปมซ้ำ
+                now = datetime.utcnow()
+                last_t = last_alert_time.get(u_sym)
+                if last_t and now - last_t < timedelta(minutes=REPEAT_AFTER_MIN):
+                    continue
+                last_alert_time[u_sym] = now
+
+                # ทำข้อความ
+                side = "🔺GAINER" if pct >= 0 else "🔻LOSER"
+                opt = option_tag(pct, price)
+                msg = (
+                    f"{side} ⚠️ QUALIFIED\n"
+                    f"{u_sym}  +{pct:.1f}% | ${price:.2f}\n"
+                    f"Vol: {_fmt_num(vol) if vol is not None else '-'}\n"
+                    f"{opt}\n"
+                    f"{now_str()}"
+                )
+                print("ALERT:", u_sym, pct, price, vol)
+                tg(msg)
                 hits += 1
 
-            # ฝั่งลง (ถ้าต้องการ)
-            if INCLUDE_LOSERS:
-                downs = fetch_movers("losers")
-                for row in downs:
-                    if not pass_filters(row, up=False):
-                        continue
-                    sym = row["sym"]
-                    tlast = last_alert_time.get(sym)
-                    if tlast and datetime.now() - tlast < timedelta(minutes=REPEAT_AFTER_MIN):
-                        continue
-                    tg(fmt_row_down("Loser", row))
-                    last_alert_time[sym] = datetime.now()
-                    hits += 1
+            print("hits:", hits)
 
-            print(f"[{datetime.now().strftime('%H:%M:%S')}] hits: {hits}")
         except Exception as e:
             print("Loop error:", e)
-            tg(f"❗ Scanner error: {e}")
+            tg(f"❗Scanner error: {e}")
 
         time.sleep(CHECK_INTERVAL_SEC)
 
-# ========== Flask (ทำให้ Render/UptimeRobot เรียกได้) ==========
+# ========= Flask keepalive =========
+from flask import Response
 app = Flask(__name__)
 
 @app.route("/")
 def home():
-    return "Bot is running fine."
+    return Response("Bot is running fine.", 200)
 
-def run_flask():
-    # พอร์ตคงที่ 10000 เพื่อให้ UptimeRobot/Render ตรวจเจอ
-    app.run(host="0.0.0.0", port=10000)
-
-# ========== Entry ==========
 if __name__ == "__main__":
-    # รัน Flask เป็น thread แยก แล้วจึงรันบอท
-    Thread(target=run_flask, daemon=True).start()
-    main()
+    # รันสแกนเนอร์ในโปรเซสหลัก และเปิด Flask บนพอร์ต Render
+    # หมายเหตุ: บน Render “Web Service” จะรันโปรเซสเดียว
+    # เราจึงรันสแกนในเทรดหลัก แล้วให้ Flask เป็นตัวรับ health check ผ่าน waitress แบบง่าย
+    import threading
+
+    t = threading.Thread(target=main, daemon=True)
+    t.start()
+
+    port = int(os.environ.get("PORT", "10000"))
+    # ใช้ werkzeug เดิมก็ได้ (Render ทำ health check ด้วย GET /)
+    app.run(host="0.0.0.0", port=port)
