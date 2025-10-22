@@ -1,365 +1,349 @@
-# main.py  — Stock Signal Bot (Polygon free mode + Telegram commands + Webhook/Flask)
+# -*- coding: utf-8 -*-
+"""
+Stock Signal Bot (Free mode with Polygon.io previous-day data)
+- /help       : เมนูคำสั่ง
+- /movers     : Top movers (โหมดฟรี อ้างอิงวันก่อนหน้า)
+- /signals    : จัดกลุ่ม Strong/Watch (CALL/PUT) + แนวคิดการเล่น
+- /outlook    : สรุปแนวโน้มวันนี้จากข้อมูลเมื่อวาน
+- health      : หน้าสถานะ Flask + webhook สำหรับ Render
+
+ต้องตั้ง ENV บน Render:
+BOT_TOKEN, POLYGON_API_KEY, PUBLIC_URL, PORT
+(ออปชัน) CHAT_ID  ถ้าอยาก broadcast ไปห้องเดียวอัตโนมัติ
+"""
+
 import os
 import json
 import time
 import math
-import queue
-import threading
+import logging
 import traceback
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
 
 import requests
 from flask import Flask, request, jsonify
+from telegram import Update, ParseMode
+from telegram.ext import (
+    Updater, Dispatcher, CommandHandler, CallbackContext
+)
 
-# ========= ENV =========
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-CHAT_ID_DEFAULT = os.getenv("CHAT_ID", "").strip()
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "").strip()
-PUBLIC_URL = os.getenv("PUBLIC_URL", "").rstrip("/")
-PORT = int(os.getenv("PORT", "10000"))
+# -------------------- ตั้งค่า logger --------------------
+logger = logging.getLogger("stock-bot")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 
-TG_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
-ET = ZoneInfo("America/New_York")
+# -------------------- ENV --------------------
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+POLYGON_API_KEY = os.environ["POLYGON_API_KEY"]
+PUBLIC_URL = os.environ["PUBLIC_URL"]  # eg. https://your-app.onrender.com
+PORT = int(os.environ.get("PORT", "10000"))
+DEFAULT_CHAT_ID = os.environ.get("CHAT_ID")  # optional
 
-# ========= Utils =========
-def _now_et():
-    return datetime.now(tz=ET)
+# เกณฑ์ค่าเริ่มต้น (แก้ได้ตามสะดวก)
+DEFAULT_MIN_PCT   = 10.0   # เปลี่ยนแปลง (%) ขั้นต่ำ
+DEFAULT_MIN_PRICE = 0.30   # ราคาปิดขั้นต่ำ
+DEFAULT_MIN_VOL   = 0      # ปริมาณขั้นต่ำ
 
-def _yesterday_et():
-    """คืนค่า YYYY-MM-DD ของ 'วันทำการก่อนหน้า' สำหรับ Polygon free (prev day grouped)"""
-    d = _now_et().date() - timedelta(days=1)
-    # ถ้าวันเสาร์/อาทิตย์ ให้เลื่อนกลับไปวันศุกร์
-    while d.weekday() >= 5:  # 5=Sat,6=Sun
-        d -= timedelta(days=1)
-    return d.isoformat()
-
+# -------------------- Utilities --------------------
 def _fmt_num(x, nd=2):
     try:
         if x is None: return "-"
-        return f"{float(x):.{nd}f}"
-    except Exception:
+        if isinstance(x, (int, float)):
+            if abs(x) >= 1e9:  # billions
+                return f"{x/1e9:.{nd}f}B"
+            if abs(x) >= 1e6:  # millions
+                return f"{x/1e6:.{nd}f}M"
+            if abs(x) >= 1e3:  # thousands
+                return f"{x/1e3:.{nd}f}K"
+            return f"{x:.{nd}f}".rstrip("0").rstrip(".")
+        return str(x)
+    except:
         return str(x)
 
-def _close_near_high(o, c, h, tol=0.05):
-    try:
-        if h is None or c is None or h == 0: return False
-        return (h - c) / h <= tol
-    except Exception:
-        return False
+def _chunk_send(bot, chat_id, text, preview=False):
+    CHUNK = 3900
+    if len(text) <= CHUNK:
+        bot.send_message(chat_id, text, parse_mode=ParseMode.HTML, disable_web_page_preview=not preview)
+    else:
+        for i in range(0, len(text), CHUNK):
+            bot.send_message(chat_id, text[i:i+CHUNK], parse_mode=ParseMode.HTML, disable_web_page_preview=not preview)
 
-def _close_near_low(o, c, l, tol=0.05):
-    try:
-        if l is None or c is None: return False
-        diff = c - l
-        rng = max(1e-9, (c if c>l else l))
-        return diff / rng <= tol
-    except Exception:
-        return False
+def _us_prev_trading_date_rough():
+    # แบบรวดเร็ว: เอา "เมื่อวาน" ของ UTC (โหมดฟรี Polygon จะเปิดให้ดึงได้ถึง T-1)
+    return (datetime.utcnow().date() - timedelta(days=1)).isoformat()
 
-def _body_strong(o, c, h, l):
-    try:
-        rng = max(1e-9, h - l)
-        body = abs(c - o)
-        return body / rng >= 0.6  # real-body >=60% ของช่วงทั้งวัน
-    except Exception:
-        return False
-
-def _pct_change(o, c):
-    try:
-        if not o: return 0.0
-        return (c - o) / o * 100.0
-    except Exception:
-        return 0.0
-
-def tg_send_text(text, chat_id=None, disable_web_page_preview=True):
-    cid = str(chat_id or CHAT_ID_DEFAULT).strip()
-    if not BOT_TOKEN or not cid:
-        print("Telegram config missing.")
-        return
-    try:
-        r = requests.post(
-            TG_API + "/sendMessage",
-            json={
-                "chat_id": int(cid),
-                "text": text,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": disable_web_page_preview,
-            },
-            timeout=20,
-        )
-        if r.status_code != 200:
-            print("TG send:", r.status_code, r.text)
-    except Exception as e:
-        print("TG error:", e)
-
-# ========= Polygon (free) =========
-def polygon_grouped_prevday(date_iso: str):
+# -------------------- ดึงข้อมูล Polygon (โหมดฟรี: previous-day grouped) --------------------
+def polygon_grouped_day(date_iso):
     """
-    ใช้ endpoint ฟรี: /v2/aggs/grouped/locale/us/market/stocks/{date}
-    คืน list ของ dict: {T, v, o, c, h, l, ...}
+    เรียก grouped aggs (T-1) จาก Polygon (โหมดฟรีใช้ข้อมูลถึง 'เมื่อวาน')
     """
-    url = (
-        f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{date_iso}"
-        f"?adjusted=true&apiKey={POLYGON_API_KEY}"
-    )
-    r = requests.get(url, timeout=40)
+    url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{date_iso}"
+    params = {
+        "adjusted": "true",
+        "apiKey": POLYGON_API_KEY
+    }
+    r = requests.get(url, params=params, timeout=30)
     if r.status_code != 200:
-        raise RuntimeError(f"Polygon HTTP {r.status_code}: {r.text}")
+        raise RuntimeError(f"Polygon {r.status_code}: {r.text}")
     data = r.json()
     if data.get("status") != "OK":
-        # free plan: ถ้าเรียกวันปัจจุบันจะได้ NOT_AUTHORIZED
-        raise RuntimeError(json.dumps(data))
+        # โหมดฟรี ถ้าขอวันปัจจุบันจะได้ NOT_AUTHORIZED
+        # ให้โยน error ขึ้นไปเพื่อให้โค้ดไปดึงวันก่อนแทน
+        raise RuntimeError(data.get("message") or str(data))
     return data.get("results", [])
 
-# ========= Classifier =========
-def classify_signals_from_grouped(results, min_price=0.30, min_vol=0):
+def fetch_top_movers_free(date_iso=None, min_pct=DEFAULT_MIN_PCT, min_price=DEFAULT_MIN_PRICE, min_vol=DEFAULT_MIN_VOL):
     """
-    จัดสัญญาณ 4 กลุ่ม:
-      Strong CALL, Watch CALL, Strong PUT, Watch PUT
-    เกณฑ์เน้นเข้าใจง่ายและไม่พึ่งข้อมูลเรียลไทม์ (ยึด prev-day)
+    คืน list ของ dict ต่อหุ้น: { 'T':symbol, 'o','h','l','c','v','pct','close_near_high','close_near_low' }
+    กรองด้วยเกณฑ์ที่กำหนด
+    """
+    if not date_iso:
+        date_iso = _us_prev_trading_date_rough()
+
+    try:
+        rows = polygon_grouped_day(date_iso)
+    except Exception as e:
+        # ถ้าเจอ NOT_AUTHORIZED เพราะขอวันปัจจุบัน ลองถอยไปอีกวัน
+        logger.warning("Primary fetch failed (%s), retry with date-1", e)
+        d = (datetime.fromisoformat(date_iso) - timedelta(days=1)).date().isoformat()
+        rows = polygon_grouped_day(d)
+        date_iso = d
+
+    out = []
+    for r in rows:
+        # polygon fields: T=Ticker, o=open, h=high, l=low, c=close, v=volume
+        T = r.get("T")
+        o = r.get("o")
+        h = r.get("h")
+        l = r.get("l")
+        c = r.get("c")
+        v = r.get("v")
+        if not (T and o and c and h and l and v is not None):
+            continue
+        if o <= 0 or c <= 0:
+            continue
+
+        price_ok = c >= min_price
+        vol_ok   = (v or 0) >= min_vol
+        pct = (c - o) * 100.0 / o
+        pct_ok = abs(pct) >= min_pct
+
+        if price_ok and vol_ok and pct_ok:
+            # ความใกล้ High/Low
+            near_high = (h > 0 and (h - c) / h <= 0.02)  # ปิดใกล้ High <=2%
+            near_low  = (l > 0 and (c - l) / max(c, 1e-9) <= 0.02)  # ปิดใกล้ Low <=2%
+            out.append({
+                "T": T, "o": o, "h": h, "l": l, "c": c, "v": v,
+                "pct": pct,
+                "close_near_high": near_high,
+                "close_near_low": near_low
+            })
+    # เรียงเลือกเด่นสุด (เอาฝั่งบวกก่อน ตามสัดส่วนการเปลี่ยนแปลง)
+    out.sort(key=lambda x: (-x["pct"], -x["v"]))
+    return out
+
+# -------------------- จัดกลุ่มสัญญาณ --------------------
+def build_signals_from_day(rows, header=""):
+    """
+    แบ่งเป็น Strong CALL / Watch CALL / Strong PUT / Watch PUT
+    criteria คร่าว ๆ:
+      Strong CALL: pct >= 15, ปิดใกล้ High
+      Watch  CALL: pct >= 10, ไม่ถึงเงื่อนไข Strong
+      Strong PUT : pct <= -15, ปิดใกล้ Low
+      Watch  PUT : pct <= -10, ไม่ถึงเงื่อนไข Strong
     """
     strong_call, watch_call, strong_put, watch_put = [], [], [], []
 
-    for item in results:
-        s = item.get("T")   # symbol
-        v = float(item.get("v", 0))
-        o = float(item.get("o", 0))
-        c = float(item.get("c", 0))
-        h = float(item.get("h", 0))
-        l = float(item.get("l", 0))
-        if not s or c <= 0 or c < min_price or v < min_vol or o <= 0:
-            continue
+    for r in rows:
+        sym, pct, c, h, l, v = r["T"], r["pct"], r["c"], r["h"], r["l"], r["v"]
+        near_h, near_l = r["close_near_high"], r["close_near_low"]
 
-        pct = _pct_change(o, c)
-        note = []
+        if pct >= 15 and near_h:
+            strong_call.append((sym, pct, c, v, h))
+        elif pct >= 10:
+            watch_call.append((sym, pct, c, v, h))
+        elif pct <= -15 and near_l:
+            strong_put.append((sym, pct, c, v, l))
+        elif pct <= -10:
+            watch_put.append((sym, pct, c, v, l))
 
-        # คุณสมบัติเพิ่มเติมสำหรับข้อความประกอบ
-        if _close_near_high(o, c, h): note.append("close near H")
-        if _close_near_low(o, c, l):  note.append("close near L")
-        if _body_strong(o, c, h, l):  note.append("strong body")
+    def _line(name, bucket):
+        if not bucket:
+            return f"• {name}: -"
+        # จำกัดโชว์ 30
+        bucket = bucket[:30]
+        s = [f"{t[0]} @{_fmt_num(t[2])} — pct {_fmt_num(t[1],1)}%, Vol {_fmt_num(t[3])}" for t in bucket]
+        return "• " + name + ": " + ", ".join(s)
 
-        # Heuristics
-        if pct >= 15.0:
-            # เขียวแรง
-            if _close_near_high(o, c, h) or _body_strong(o, c, h, l):
-                strong_call.append((s, pct, c, v, ", ".join(note)))
-            else:
-                watch_call.append((s, pct, c, v, ", ".join(note)))
-        elif 7.0 <= pct < 15.0:
-            watch_call.append((s, pct, c, v, ", ".join(note)))
+    lines = []
+    if header:
+        lines.append(header.strip())
+    lines += [
+        "🟣 <b>คาดการณ์แนวโน้มวันนี้</b> (อิงจากข้อมูลเมื่อวาน)",
+        _line("Momentum ขาขึ้น — <b>Strong CALL 30</b>", strong_call),
+        _line("ลุ้นเบรกขึ้น — <b>Watch CALL 30</b>", watch_call),
+        _line("Momentum ขาลง — <b>Strong PUT 30</b>", strong_put),
+        _line("ระวังอ่อนแรง — <b>Watch PUT 30</b>", watch_put),
+        "",
+        "💡 <b>แนวคิด:</b>",
+        "• Strong CALL มักเปิดบวก/ลุ้นทำ High ใหม่ ถ้าจ่อจุดหนุน",
+        "• Watch CALL รอเบรก High เดิม + วอลุ่มเพิ่ม",
+        "• Strong PUT ลงต่อหรือรีบาวน์สั้น",
+        "• Watch PUT ระวังหลุดแนวรับ",
+    ]
+    return "\n".join(lines)
 
-        if pct <= -15.0:
-            if _close_near_low(o, c, l) or _body_strong(o, c, h, l):
-                strong_put.append((s, pct, c, v, ", ".join(note)))
-            else:
-                watch_put.append((s, pct, c, v, ", ".join(note)))
-        elif -15.0 < pct <= -7.0:
-            watch_put.append((s, pct, c, v, ", ".join(note)))
+# -------------------- Cache ง่าย ๆ กันเรียกซ้ำ --------------------
+_cache = {
+    "signals": {"date": None, "text": None},
+    "movers": {"date": None, "text": None},
+    "outlook": {"date": None, "text": None},
+}
 
-    # เรียงลำดับเพื่อแสดงสวย ๆ
-    strong_call.sort(key=lambda x: (-x[1], -x[3]))
-    watch_call.sort(key=lambda x: (-x[1], -x[3]))
-    strong_put.sort(key=lambda x: (x[1], -x[3]))   # pct ติดลบเยอะก่อน
-    watch_put.sort(key=lambda x: (x[1], -x[3]))
-
-    return {
-        "strong_call": strong_call,
-        "watch_call": watch_call,
-        "strong_put": strong_put,
-        "watch_put": watch_put,
-    }
-
-# ========= Feature: Movers (free) =========
-def do_movers_free(chat_id=None, min_pct=10.0, min_price=0.30, min_vol=0):
-    ref = _yesterday_et()
-    tg_send_text("🕰️ กำลังดึงข้อมูลโหมดฟรีจาก Polygon...", chat_id)
-    results = polygon_grouped_prevday(ref)
-
-    # คัดเฉพาะขึ้นแรง
-    ups = []
-    for it in results:
-        s = it.get("T")
-        v = float(it.get("v", 0))
-        o = float(it.get("o", 0))
-        c = float(it.get("c", 0))
-        if not s or c < min_price or v < min_vol or o <= 0:
-            continue
-        pct = _pct_change(o, c)
-        if pct >= min_pct:
-            ups.append((s, pct, c, v))
-    ups.sort(key=lambda x: (-x[1], -x[3]))
-
-    lines = [f"✅ <b>Top Movers</b> (ฟรี, ย้อนหลังวันล่าสุด)\nวันที่อ้างอิง: {ref}\nเกณฑ์: ≥{min_pct:.1f}% | ราคา ≥{min_price} | Vol ≥{min_vol}\n\n📈 <b>ขาขึ้น:</b>"]
-    if not ups:
-        lines.append("• (ไม่พบ)")
-    else:
-        for s, pct, c, v in ups[:40]:
-            lines.append(f"• <b>{s}</b> +{_fmt_num(pct,1)}% @{_fmt_num(c,2)}  Vol:{int(v):,}")
-
-    tg_send_text("\n".join(lines), chat_id)
-
-# ========= Feature: Signals (lists) =========
-def do_signals(chat_id=None):
-    ref = _yesterday_et()
-    results = polygon_grouped_prevday(ref)
-    groups = classify_signals_from_grouped(results)
-
-    msgs = []
-    msgs.append("🟢 <b>Strong CALL</b>\n" + "\n".join(
-        [f"• <b>{s}</b> @{_fmt_num(c,2)} — pct {_fmt_num(p,1)}%, Vol {int(v):,}, {n}" if n else
-         f"• <b>{s}</b> @{_fmt_num(c,2)} — pct {_fmt_num(p,1)}%, Vol {int(v):,}"
-         for (s, p, c, v, n) in groups["strong_call"][:30]
-        ] or ["• (ไม่มีตัวเด่น)"]
-    ))
-    msgs.append("🟢 <b>Watch CALL</b>\n" + "\n".join(
-        [f"• <b>{s}</b> @{_fmt_num(c,2)} — pct {_fmt_num(p,1)}%, Vol {int(v):,}, {n}" if n else
-         f"• <b>{s}</b> @{_fmt_num(c,2)} — pct {_fmt_num(p,1)}%, Vol {int(v):,}"
-         for (s, p, c, v, n) in groups["watch_call"][:30]
-        ] or ["• (ไม่มีตัวเด่น)"]
-    ))
-    msgs.append("🔴 <b>Strong PUT</b>\n" + "\n".join(
-        [f"• <b>{s}</b> @{_fmt_num(c,2)} — pct {_fmt_num(p,1)}%, Vol {int(v):,}, {n}" if n else
-         f"• <b>{s}</b> @{_fmt_num(c,2)} — pct {_fmt_num(p,1)}%, Vol {int(v):,}"
-         for (s, p, c, v, n) in groups["strong_put"][:30]
-        ] or ["• (ไม่มีตัวเด่น)"]
-    ))
-    msgs.append("🔴 <b>Watch PUT</b>\n" + "\n".join(
-        [f"• <b>{s}</b> @{_fmt_num(c,2)} — pct {_fmt_num(p,1)}%, Vol {int(v):,}, {n}" if n else
-         f"• <b>{s}</b> @{_fmt_num(c,2)} — pct {_fmt_num(p,1)}%, Vol {int(v):,}"
-         for (s, p, c, v, n) in groups["watch_put"][:30]
-        ] or ["• (ไม่มีตัวเด่น)"]
-    ))
-
-    tg_send_text("\n\n".join(msgs), chat_id)
-
-# ========= Feature: Outlook (summary + examples) =========
-def do_outlook(chat_id=None):
-    ref = _yesterday_et()
-    tg_send_text("⏳ กำลังดึงข้อมูลโหมดฟรีจาก Polygon...", chat_id)
-    results = polygon_grouped_prevday(ref)
-    g = classify_signals_from_grouped(results)
-
-    def _eg(lst, n=12):
-        return ", ".join([x[0] for x in lst[:n]]) if lst else "-"
-
+# -------------------- Telegram Handlers --------------------
+def cmd_help(update: Update, context: CallbackContext):
     text = (
-        "🔮 <b>คาดการณ์แนวโน้มวันนี้</b> (อิงจากข้อมูลเมื่อวาน)\n"
-        f"• <b>Momentum ขาขึ้น:</b> Strong CALL 30 — ตัวอย่าง: { _eg(g['strong_call']) }\n"
-        f"• <b>ลุ้นเบรกขึ้น:</b> Watch CALL 30 — ตัวอย่าง: { _eg(g['watch_call']) }\n"
-        f"• <b>Momentum ขาลง:</b> Strong PUT 30 — ตัวอย่าง: { _eg(g['strong_put']) }\n"
-        f"• <b>ระวังอ่อนแรง:</b> Watch PUT 30 — ตัวอย่าง: { _eg(g['watch_put']) }\n\n"
-        "💡 <b>แนวคิด:</b>\n"
-        "• Strong CALL มักเปิดบวก/ลุ้นทำ High ใหม่ ถ้าจ่อจุดหนุน\n"
-        "• Watch CALL รอเบรก High เดิม + วอลุ่มเพิ่ม\n"
-        "• Strong PUT ลงต่อหรือรีบาวน์สั้น\n"
-        "• Watch PUT ระวังหลุดแนวรับ"
+        "👋 ยินดีต้อนรับสู่ Stock Signal Bot (โหมดฟรี)\n"
+        "คำสั่งที่ใช้ได้\n"
+        "• /movers – ดู Top Movers (ฟรี)\n"
+        "• /signals – จัดกลุ่ม Watch/Strong (CALL/PUT)\n"
+        "• /outlook – คาดการณ์โมเมนตัมวันนี้ (อิงจากเมื่อวาน)\n"
+        "• /help – ดูเมนูนี้อีกครั้ง\n\n"
+        f"เกณฑ์: pct ≥ {DEFAULT_MIN_PCT:.1f}%, ราคา ≥ {DEFAULT_MIN_PRICE:.2f}, Vol ≥ {DEFAULT_MIN_VOL}"
     )
-    tg_send_text(text, chat_id)
+    update.message.reply_text(text)
 
-# ========= Feature: Picks (quick ideas)
-def do_picks(chat_id=None):
-    ref = _yesterday_et()
-    results = polygon_grouped_prevday(ref)
-    g = classify_signals_from_grouped(results)
+def cmd_movers(update: Update, context: CallbackContext):
+    chat_id = update.effective_chat.id
+    try:
+        update.message.reply_text("⏳ กำลังดึง Top Movers (โหมดฟรี)…")
 
-    picks = []
+        d = _us_prev_trading_date_rough()
 
-    def _pick_side(title, lst, take=5, side="CALL"):
-        if not lst:
-            picks.append(f"{title}: -")
+        # ใช้แคช
+        if _cache["movers"]["date"] == d and _cache["movers"]["text"]:
+            _chunk_send(context.bot, chat_id, _cache["movers"]["text"])
             return
-        lines = []
-        for s, pct, c, v, note in lst[:take]:
-            reason = []
-            if side == "CALL":
-                if "close near H" in (note or ""): reason.append("close≈H")
-                if "strong body" in (note or ""): reason.append("body▲")
-                if pct >= 20: reason.append("mom▲")
-            else:
-                if "close near L" in (note or ""): reason.append("close≈L")
-                if "strong body" in (note or ""): reason.append("body▼")
-                if pct <= -20: reason.append("mom▼")
-            lines.append(f"• <b>{s}</b> @{_fmt_num(c,2)} — pct {_fmt_num(pct,1)}%, Vol {int(v):,}  ({', '.join(reason)})")
-        picks.append(f"{title}\n" + "\n".join(lines))
 
-    _pick_side("✅ <b>ไอเดีย CALL</b> (เน้นแรงสุดเมื่อวาน)", g["strong_call"], side="CALL")
-    _pick_side("🟡 <b>รอเบรก CALL</b>", g["watch_call"], side="CALL")
-    _pick_side("⛔ <b>ไอเดีย PUT</b> (ลงแรงเมื่อวาน)", g["strong_put"], side="PUT")
-    _pick_side("🔻 <b>ระวังอ่อนแรง PUT</b>", g["watch_put"], side="PUT")
+        rows = fetch_top_movers_free(date_iso=d)
+        if not rows:
+            context.bot.send_message(chat_id, "⚠️ ไม่มีรายการที่ผ่านเกณฑ์ในโหมดฟรี")
+            return
 
-    tg_send_text("\n\n".join(picks), chat_id)
+        # สรุปแสดง TOP 20 ขาขึ้น
+        ups = [r for r in rows if r["pct"] > 0][:20]
+        lines = [
+            f"✅ <b>Top Movers</b> (ฟรี, ย้อนหลังวันล่าสุด)\nวันอ้างอิง: {d}\n"
+            f"เกณฑ์: ≥ {DEFAULT_MIN_PCT:.1f}% | ราคา ≥ {DEFAULT_MIN_PRICE} | Vol ≥ {DEFAULT_MIN_VOL}\n",
+            "📈 <b>ขึ้นแรง:</b>"
+        ]
+        for r in ups:
+            lines.append(f"• {r['T']} @{_fmt_num(r['c'])} — pct {_fmt_num(r['pct'],1)}%, Vol {_fmt_num(r['v'])}")
 
-# ========= Telegram Webhook router =========
-def _handle_command(text: str, chat_id: str):
-    t = (text or "").strip().lower()
-    if t.startswith("/help"):
-        tg_send_text(
-            "👋 ยินดีต้อนรับสู่ Stock Signal Bot (โหมดฟรี)\n"
-            "คำสั่งที่ใช้ได้\n"
-            "• <b>/movers</b> – ดู Top Movers (ฟรี)\n"
-            "• <b>/signals</b> – จัดกลุ่ม Watch/Strong (CALL/PUT)\n"
-            "• <b>/outlook</b> – คาดการณ์โมเมนตัมวันนี้ (อิงเมื่อวาน)\n"
-            "• <b>/picks</b> – ชุดไอเดียสั้น ๆ พร้อมเหตุผลประกอบ\n"
-            f"\nเกณฑ์เริ่มต้น: pct ≥ 10.0%, ราคา ≥ 0.30, Vol ≥ 0\n", chat_id
+        text = "\n".join(lines)
+        _cache["movers"]["date"] = d
+        _cache["movers"]["text"] = text
+        _chunk_send(context.bot, chat_id, text)
+
+    except Exception as e:
+        logger.error("movers error: %s\n%s", e, traceback.format_exc())
+        context.bot.send_message(chat_id, f"❌ Movers error: {e}")
+
+def cmd_signals(update: Update, context: CallbackContext):
+    chat_id = update.effective_chat.id
+    try:
+        context.bot.send_message(chat_id, "⏳ กำลังคัดสัญญาณจากข้อมูลวันล่าสุด (โหมดฟรี)…")
+
+        d = _us_prev_trading_date_rough()
+        if _cache["signals"]["date"] == d and _cache["signals"]["text"]:
+            _chunk_send(context.bot, chat_id, _cache["signals"]["text"])
+            return
+
+        rows = fetch_top_movers_free(date_iso=d)
+        if not rows:
+            context.bot.send_message(chat_id, "⚠️ วันนี้ยังไม่มีข้อมูลที่ตรงเกณฑ์จากโหมดฟรี")
+            return
+
+        text = build_signals_from_day(
+            rows,
+            header=f"🔮 คัดสัญญาณจาก {d} (โหมดฟรีจาก Polygon)"
         )
-    elif t.startswith("/movers"):
-        do_movers_free(chat_id)
-    elif t.startswith("/signals"):
-        do_signals(chat_id)
-    elif t.startswith("/outlook"):
-        do_outlook(chat_id)
-    elif t.startswith("/picks") or t.startswith("/pick"):
-        do_picks(chat_id)
-    else:
-        tg_send_text("พิมพ์ /help เพื่อดูคำสั่งที่ใช้ได้ครับ", chat_id)
+        _cache["signals"]["date"] = d
+        _cache["signals"]["text"] = text
+        _chunk_send(context.bot, chat_id, text)
 
-# ========= Flask App =========
+    except Exception as e:
+        logger.error("signals error: %s\n%s", e, traceback.format_exc())
+        context.bot.send_message(chat_id, f"❌ Signals error: {e}")
+
+def cmd_outlook(update: Update, context: CallbackContext):
+    chat_id = update.effective_chat.id
+    try:
+        context.bot.send_message(chat_id, "⏳ กำลังดึงข้อมูลโหมดฟรีจาก Polygon…")
+
+        d = _us_prev_trading_date_rough()
+        if _cache["outlook"]["date"] == d and _cache["outlook"]["text"]:
+            _chunk_send(context.bot, chat_id, _cache["outlook"]["text"])
+            return
+
+        rows = fetch_top_movers_free(date_iso=d)
+        if not rows:
+            context.bot.send_message(chat_id, "⚠️ ยังไม่มีข้อมูลผ่านเกณฑ์")
+            return
+
+        # คร่าว ๆ: ใช้ build_signals เดิมแล้วบรรทัดหัว + แนวคิด
+        text = build_signals_from_day(
+            rows,
+            header="⏳ กำลังดึงข้อมูลโหมดฟรีจาก Polygon…"
+        )
+        _cache["outlook"]["date"] = d
+        _cache["outlook"]["text"] = text
+        _chunk_send(context.bot, chat_id, text)
+
+    except Exception as e:
+        logger.error("outlook error: %s\n%s", e, traceback.format_exc())
+        context.bot.send_message(chat_id, f"❌ Outlook error: {e}")
+
+# -------------------- Telegram Setup (Webhook) --------------------
+updater = Updater(BOT_TOKEN, use_context=True)
+dispatcher: Dispatcher = updater.dispatcher
+
+# คำสั่ง
+dispatcher.add_handler(CommandHandler("help", cmd_help))
+dispatcher.add_handler(CommandHandler("movers", cmd_movers))
+dispatcher.add_handler(CommandHandler(["signals", "signal"], cmd_signals))
+dispatcher.add_handler(CommandHandler("outlook", cmd_outlook))
+
+# -------------------- Flask (health + webhook) --------------------
 app = Flask(__name__)
 
-@app.route("/")
+@app.route("/", methods=["GET"])
 def home():
-    return "Bot is running fine."
+    return "Bot is running fine.", 200
 
-@app.route("/health")
-def health():
-    return jsonify(ok=True, time=str(datetime.utcnow()))
-
-@app.route("/telegram", methods=["POST"])
-def telegram_webhook():
-    try:
-        data = request.get_json(force=True, silent=True) or {}
-        msg = data.get("message") or data.get("edited_message") or {}
-        chat = msg.get("chat", {})
-        text = msg.get("text", "")
-        chat_id = str(chat.get("id", CHAT_ID_DEFAULT))
-        # ถ้ากำหนด CHAT_ID ไว้ ให้ตอบเฉพาะห้องนั้น
-        if CHAT_ID_DEFAULT and str(chat_id) != str(CHAT_ID_DEFAULT):
-            # ไม่ตอบห้องอื่น
-            return jsonify(status="ignored"), 200
-        if text:
-            _handle_command(text, chat_id)
-    except Exception as e:
-        print("webhook error:", e, traceback.format_exc())
-    return jsonify(ok=True)
-
-@app.route("/set-webhook")
+@app.route("/set-webhook", methods=["GET"])
 def set_webhook():
-    """เรียกสักครั้งหลัง deploy เพื่อชี้ Webhook → /telegram"""
-    try:
-        if not PUBLIC_URL:
-            return "PUBLIC_URL is required", 400
-        # base URL (กรณีผู้ใช้เผลอใส่เป็น .../set-webhook)
-        base = PUBLIC_URL
-        if base.endswith("/set-webhook") or base.endswith("/telegram"):
-            base = base.rsplit("/", 1)[0]
-        url = f"{base}/telegram"
-        r = requests.get(f"{TG_API}/setWebhook", params={"url": url}, timeout=20)
-        return f"setWebhook → {url} : {r.status_code} {r.text}"
-    except Exception as e:
-        return f"Error: {e}", 500
+    url = f"{PUBLIC_URL}/webhook"
+    ok = updater.bot.set_webhook(url=url, max_connections=40)
+    return jsonify({"ok": ok, "webhook": url})
 
-# ========= main =========
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    try:
+        update = Update.de_json(request.get_json(force=True), updater.bot)
+        dispatcher.process_update(update)
+    except Exception as e:
+        logger.error("webhook error: %s\n%s", e, traceback.format_exc())
+    return "ok", 200
+
+# -------------------- Entry --------------------
 if __name__ == "__main__":
-    print("Starting Flask on 0.0.0.0:", PORT)
+    # ตั้ง webhook ตอนสตาร์ท (เผื่อกรณีต้องการ)
+    try:
+        url = f"{PUBLIC_URL}/webhook"
+        updater.bot.set_webhook(url=url, max_connections=40)
+        logger.info("Webhook set to %s", url)
+    except Exception as e:
+        logger.warning("Set webhook failed: %s", e)
+
+    # รัน Flask เพื่อให้ Render ผูกพอร์ตได้
     app.run(host="0.0.0.0", port=PORT)
