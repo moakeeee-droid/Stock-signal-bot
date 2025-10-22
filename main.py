@@ -118,7 +118,7 @@ async def run_telegram():
 
     log.info("🚀 Starting telegram long-polling…")
     # ไม่ต้องกำหนด stop_signals เพื่อหลีกเลี่ยงการปิด loop ผิดที่
-    await app_tg.run_polling(close_loop=False)
+    await app_tg.run_polling(close_loop=False, handle_signals=False)
 
 def start_telegram_thread():
     """
