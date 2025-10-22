@@ -1,427 +1,357 @@
 # -*- coding: utf-8 -*-
 """
-Stock Signal Bot — Free mode (Polygon.io)
-คำสั่ง:
-  /help      : เมนูคำสั่ง
-  /ping      : ทดสอบบอท
-  /movers    : Top movers (โหมดฟรี — อิงข้อมูลวันทำการล่าสุดที่ฟรี)
-  /signals   : จัดกลุ่ม Strong/Watch (CALL/PUT)
-  /outlook   : มุมมองรวมจากข้อมูลล่าสุด
-  /picks     : รายการคัดสั้น ๆ (เข้าออกวันเดียว)
+Stock-signal bot (Free mode with Polygon.io)
+- /movers   : Top movers (free, previous trading day)
+- /signals  : Group CALL/PUT watch/strong (from previous day)
+- /outlook  : Summary outlook for today (derived from yesterday)
+- /help     : Show menu
 
-ต้องตั้ง Environment vars บน Render:
-  BOT_TOKEN, POLYGON_API_KEY [, CHAT_ID]
-
-หมายเหตุ: ใช้ long-polling (no webhook) และมี Flask health route สำหรับ Render
+NEW:
+- API call caching (default 10 min) -> ENV: CACHE_TTL_MIN
+- Simple rate-limit guard (default 5 calls / 60s) -> ENV: API_MAX_CALLS_PER_MIN
+- Retry with backoff on 429/5xx, graceful fallback to cached data
 """
 
 import os
-import math
 import time
-import asyncio
-import logging
+import json
+import math
+import threading
+from collections import deque
 from datetime import datetime, timedelta, timezone
-from threading import Thread
-from typing import Dict, Any, List, Tuple
 
 import requests
 from flask import Flask
 
+# telegram v13 (long-polling)
 from telegram import Update
-from telegram.constants import ParseMode
-from telegram.ext import (
-    ApplicationBuilder, Application, CommandHandler, ContextTypes
-)
+from telegram.ext import Updater, CommandHandler, CallbackContext
 
-# ------------ LOGGING ------------
-logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    level=logging.INFO,
-)
-log = logging.getLogger("stock-signal-bot")
+# -------------------- ENV & Globals --------------------
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "").strip()
+CHAT_ID = os.getenv("CHAT_ID", "").strip()  # optional broadcast room
+PORT = int(os.getenv("PORT", "10000"))
+PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip()
 
-# ------------ CONFIG ------------
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "").strip()
-CHAT_ID = os.environ.get("CHAT_ID", "").strip()  # optional broadcast room
+CACHE_TTL_MIN = int(os.getenv("CACHE_TTL_MIN", "10"))
+API_MAX_CALLS_PER_MIN = int(os.getenv("API_MAX_CALLS_PER_MIN", "5"))
 
-# เกณฑ์ default (ปรับได้ตามชอบ)
-MIN_PCT = 10.0     # เปลี่ยนแปลง % ขั้นต่ำ
-MIN_PRICE = 0.30   # ราคาปิดขั้นต่ำ
-MIN_VOL = 0        # วอลุ่มขั้นต่ำ (ชิ้น)
-TOP_LIMIT = 30     # จำนวนสูงสุดที่แสดงในแต่ละกลุ่ม
+if not BOT_TOKEN:
+    raise RuntimeError("Missing BOT_TOKEN env")
+if not POLYGON_API_KEY:
+    raise RuntimeError("Missing POLYGON_API_KEY env")
 
-# ------------ UTIL ------------
-def _fmt_num(n, d=2):
-    try:
-        return f"{n:,.{d}f}"
-    except Exception:
-        try:
-            return f"{float(n):,.{d}f}"
-        except Exception:
-            return str(n)
+# Simple in-memory cache
+_cache = {}  # key -> {"ts": epoch_sec, "data": any}
+_cache_lock = threading.Lock()
 
-def _short_vol(v: float) -> str:
-    try:
-        v = float(v)
-        if v >= 1_000_000_000:
-            return f"{v/1_000_000_000:.2f}B"
-        if v >= 1_000_000:
-            return f"{v/1_000_000:.2f}M"
-        if v >= 1_000:
-            return f"{v/1_000:.2f}K"
-        return str(int(v))
-    except Exception:
-        return str(v)
+# Simple rate limiter (token-bucket-ish)
+_call_times = deque()  # timestamps of API calls (epoch_sec)
+_call_lock = threading.Lock()
 
-def _is_weekend(dt: datetime) -> bool:
-    return dt.weekday() >= 5  # Sat(5), Sun(6)
+# Flask (health)
+app = Flask(__name__)
 
-def last_free_trading_date(today_utc: datetime) -> str:
-    """
-    โหมดฟรีของ Polygon บางแผนจะอิงข้อมูลไม่ใช่แบบ real-time
-    เราจะถอยกลับไปเรื่อย ๆ จน API ยอมตอบ (หรืออย่างน้อยวันทำการล่าสุด)
-    คืนค่าเป็น YYYY-MM-DD
-    """
-    d = today_utc.astimezone(timezone.utc).date()
-    # ถ้าเป็นเสาร์/อาทิตย์ ถอยไปวันศุกร์
-    if _is_weekend(datetime(d.year, d.month, d.day)):
-        while _is_weekend(datetime(d.year, d.month, d.day)):
-            d = d - timedelta(days=1)
-        return d.isoformat()
-    return d.isoformat()
 
-# ------------ POLYGON FETCH (FREE) ------------
-_cache: Dict[str, Any] = {"date": None, "items": None}
-
-def fetch_grouped_by_date(date_str: str) -> Tuple[str, List[Dict[str, Any]], str]:
-    """
-    ดึง grouped bars (US stocks) จาก Polygon สำหรับ date_str (YYYY-MM-DD)
-    จะพยายามถอยวันอัตโนมัติถ้าเจอ NOT_AUTHORIZED ของโหมดฟรี
-    """
-    base = "https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks"
-    attempts = 0
-    last_err = ""
-    cur = datetime.strptime(date_str, "%Y-%m-%d").date()
-
-    while attempts < 5:
-        url = f"{base}/{cur.isoformat()}?adjusted=true&apiKey={POLYGON_API_KEY}"
-        try:
-            r = requests.get(url, timeout=20)
-            if r.status_code == 200:
-                data = r.json()
-                if data.get("resultsCount", 0) > 0 and isinstance(data.get("results"), list):
-                    return (cur.isoformat(), data["results"], "")
-                else:
-                    last_err = "No results from Polygon."
-            else:
-                try:
-                    js = r.json()
-                    msg = js.get("message", "")
-                    last_err = f"{r.status_code}: {msg}"
-                    # โหมดฟรีถ้าขอวันปัจจุบันอาจได้ NOT_AUTHORIZED ให้ถอยวัน
-                    if "NOT_AUTHORIZED" in js.get("status", "") or "Attempted to request today's data" in msg:
-                        cur = cur - timedelta(days=1)
-                        attempts += 1
-                        time.sleep(0.5)
-                        continue
-                except Exception:
-                    last_err = f"HTTP {r.status_code}"
-        except Exception as e:
-            last_err = f"Exception: {e}"
-
-        # ถ้าไม่สำเร็จให้ถอยวันทำการหนึ่งวัน
-        cur = cur - timedelta(days=1)
-        attempts += 1
-        time.sleep(0.4)
-
-    return (date_str, [], last_err or "Failed to fetch data.")
-
-def load_market() -> Tuple[str, List[Dict[str, Any]], str]:
-    """
-    ดึงข้อมูลและแคชไว้ (ป้องกันโดน rate limit)
-    """
-    global _cache
-    today = datetime.now(timezone.utc)
-    want = last_free_trading_date(today)
-    if _cache["date"] == want and isinstance(_cache["items"], list):
-        return (_cache["date"], _cache["items"], "")
-
-    date_used, items, err = fetch_grouped_by_date(want)
-    if not err and items:
-        _cache["date"] = date_used
-        _cache["items"] = items
-    return (date_used, items, err)
-
-# ------------ SCORING / GROUPING ------------
-def qualify(item: Dict[str, Any]) -> bool:
-    """
-    กรองเบื้องต้นตามเกณฑ์
-    """
-    c = item.get("c", 0.0)  # close
-    o = item.get("o", 0.0)  # open
-    h = item.get("h", 0.0)
-    l = item.get("l", 0.0)
-    v = item.get("v", 0.0)
-    # บางรายการไม่มีเปอร์เซ็นต์ ต้องคำนวณเองจาก OHLC
-    pct = 0.0
-    try:
-        if o and isinstance(o, (int, float)) and o > 0:
-            pct = (c - o) / o * 100.0
-    except Exception:
-        pct = 0.0
-
-    sym = item.get("T", "")
-    if not sym or "." in sym:  # ตัด .W, .U ฯลฯ ออกบ้าง (แล้วแต่ชอบ)
-        pass
-
-    return (
-        (pct >= MIN_PCT or (-pct) >= MIN_PCT) and
-        (c >= MIN_PRICE) and
-        (v >= MIN_VOL)
-    )
-
-def classify(items: List[Dict[str, Any]]) -> Dict[str, List[Tuple[str, Dict[str, Any]]]]:
-    """
-    จัดกลุ่มเป็น Strong/Watch (CALL/PUT) แบบ heuristic ง่าย ๆ
-    - Strong CALL: pct ≥ 15%, close ใกล้ High (≥ 98%), body เขียว (c>o)
-    - Watch CALL : pct 10–15% หรือ close ใกล้ High (≥ 97%) และเขียว
-    - Strong PUT : pct ≤ −15%, close ใกล้ Low (≤ 102% ของ Low), body แดง (c<o)
-    - Watch PUT  : pct −10% ถึง −15% หรือ close ใกล้ Low (≤ 103%) และแดง
-    """
-    out = {"strong_call": [], "watch_call": [], "strong_put": [], "watch_put": []}
-
-    for it in items:
-        if not qualify(it):
-            continue
-        sym = it.get("T", "")
-        o = it.get("o", 0.0)
-        c = it.get("c", 0.0)
-        h = it.get("h", 0.0)
-        l = it.get("l", 0.0)
-        v = it.get("v", 0.0)
-
-        pct = 0.0
-        try:
-            pct = (c - o) / o * 100.0 if o else 0.0
-        except Exception:
-            pass
-
-        near_high = (h > 0 and c >= 0.98 * h)
-        near_high_loose = (h > 0 and c >= 0.97 * h)
-        near_low = (l > 0 and c <= 1.02 * l)
-        near_low_loose = (l > 0 and c <= 1.03 * l)
-
-        if pct >= 15 and c > o and near_high:
-            out["strong_call"].append((sym, it))
-        elif pct >= 10 and c > o and (near_high_loose or pct >= 12):
-            out["watch_call"].append((sym, it))
-        elif pct <= -15 and c < o and near_low:
-            out["strong_put"].append((sym, it))
-        elif pct <= -10 and c < o and (near_low_loose or pct <= -12):
-            out["watch_put"].append((sym, it))
-
-    # sort by absolute momentum
-    out["strong_call"].sort(key=lambda x: (x[1]["c"] - x[1]["o"]) / (x[1]["o"] or 1), reverse=True)
-    out["watch_call"].sort(key=lambda x: (x[1]["c"] - x[1]["o"]) / (x[1]["o"] or 1), reverse=True)
-    out["strong_put"].sort(key=lambda x: (x[1]["c"] - x[1]["o"]) / (x[1]["o"] or 1))
-    out["watch_put"].sort(key=lambda x: (x[1]["c"] - x[1]["o"]) / (x[1]["o"] or 1))
-
-    # limit
-    for k in out:
-        out[k] = out[k][:TOP_LIMIT]
-    return out
-
-def picks_from_groups(groups: Dict[str, List[Tuple[str, Dict[str, Any]]]]) -> List[Tuple[str, Dict[str, Any], str]]:
-    """
-    เลือก pick สั้น ๆ จาก Strong CALL/PUT อย่างละไม่กี่ตัว
-    """
-    picks: List[Tuple[str, Dict[str, Any], str]] = []
-    for sym, it in groups.get("strong_call", [])[:7]:
-        picks.append((sym, it, "CALL"))
-    for sym, it in groups.get("strong_put", [])[:7]:
-        picks.append((sym, it, "PUT"))
-    return picks
-
-# ------------ TEXT BUILDERS ------------
-def line_from_item(sym: str, it: Dict[str, Any]) -> str:
-    o, c, h, l, v = it.get("o", 0.0), it.get("c", 0.0), it.get("h", 0.0), it.get("l", 0.0), it.get("v", 0.0)
-    pct = ( (c - o) / o * 100.0 ) if (o) else 0.0
-    return f"• <b>{sym}</b> @{_fmt_num(c, 2)} — pct {_fmt_num(pct,1)}%, close near {'H' if h and c>=0.98*h else ('L' if l and c<=1.02*l else 'mid')}, Vol {_short_vol(v)}"
-
-def build_movers_text(date_used: str, items: List[Dict[str, Any]]) -> str:
-    # เอาเฉพาะขาขึ้นตามเกณฑ์ และเรียง pct จากมากไปน้อย
-    rows = []
-    for it in items:
-        if not qualify(it):
-            continue
-        o, c = it.get("o", 0.0), it.get("c", 0.0)
-        pct = ( (c - o) / o * 100.0 ) if (o) else 0.0
-        if pct >= MIN_PCT:
-            rows.append((it.get("T", ""), pct, it))
-    rows.sort(key=lambda x: x[1], reverse=True)
-    rows = rows[:TOP_LIMIT]
-
-    msg = [f"✅ <b>Top Movers</b> (โหมดฟรี, ข้อมูลอิงวัน: <code>{date_used}</code>)"]
-    msg.append(f"เกณฑ์: pct ≥ {MIN_PCT:.1f}% | ราคา ≥ {MIN_PRICE} | Vol ≥ {MIN_VOL}")
-    if not rows:
-        msg.append("• ไม่มีรายการตามเกณฑ์")
-        return "\n".join(msg)
-
-    msg.append("\n📈 <b>ขึ้นแรง:</b>")
-    for sym, pct, it in rows:
-        c, v = it.get("c", 0.0), it.get("v", 0.0)
-        msg.append(f"• {sym} +{_fmt_num(pct,1)}% @{_fmt_num(c,2)} Vol:{_short_vol(v)}")
-    return "\n".join(msg)
-
-def build_signals_text(date_used: str, groups: Dict[str, List[Tuple[str, Dict[str, Any]]]]) -> str:
-    def short_list(arr: List[Tuple[str, Dict[str, Any]]]) -> str:
-        syms = [s for s,_ in arr[:30]]
-        return ", ".join(syms) if syms else "-"
-
-    msg = [f"🔮 <b>คาดการณ์แนวโน้มวันนี้</b> (อิงจากข้อมูล <code>{date_used}</code>)"]
-    msg.append(f"• <b>Momentum ขาขึ้น</b>: <u>Strong CALL {TOP_LIMIT}</u> — ตัวอย่าง: {short_list(groups['strong_call'])}")
-    msg.append(f"• <b>ลุ้นเบรกขึ้น</b>: <u>Watch CALL {TOP_LIMIT}</u> — ตัวอย่าง: {short_list(groups['watch_call'])}")
-    msg.append(f"• <b>Momentum ขาลง</b>: <u>Strong PUT {TOP_LIMIT}</u> — ตัวอย่าง: {short_list(groups['strong_put'])}")
-    msg.append(f"• <b>ระวังอ่อนแรง</b>: <u>Watch PUT {TOP_LIMIT}</u> — ตัวอย่าง: {short_list(groups['watch_put'])}")
-
-    msg.append("\n💡 <b>แนวคิด:</b>")
-    msg.append("• Strong CALL มักเปิดบวก/ลุ้นทำ High ใหม่ ถ้าจ่อจุดหนุน")
-    msg.append("• Watch CALL รอเบรก High เดิม + วอลุ่มเพิ่ม")
-    msg.append("• Strong PUT ลงต่อหรือรีบาวน์สั้น")
-    msg.append("• Watch PUT ระวังหลุดแนวรับ")
-    return "\n".join(msg)
-
-def build_picks_text(date_used: str, picks: List[Tuple[str, Dict[str, Any], str]]) -> str:
-    if not picks:
-        return "ยังไม่มี pick จากเงื่อนไขวันนี้"
-    msg = [f"🎯 <b>Picks (เข้า-ออกวันเดียว)</b> จากข้อมูล <code>{date_used}</code>"]
-    for sym, it, side in picks:
-        msg.append(f"{'🟢' if side=='CALL' else '🔴'} {line_from_item(sym, it)}")
-    return "\n".join(msg)
-
-def build_outlook_text(date_used: str, groups: Dict[str, List[Tuple[str, Dict[str, Any]]]]) -> str:
-    sc, wc = len(groups["strong_call"]), len(groups["watch_call"])
-    sp, wp = len(groups["strong_put"]), len(groups["watch_put"])
-    bias = "กลาง"
-    if (sc + wc) > (sp + wp) * 1.3:
-        bias = "เป็นบวก (เอียง CALL)"
-    elif (sp + wp) > (sc + wc) * 1.3:
-        bias = "เป็นลบ (เอียง PUT)"
-    msg = [
-        f"🧭 <b>Outlook</b> (อิง <code>{date_used}</code>)",
-        f"• Strong CALL: {sc} | Watch CALL: {wc}",
-        f"• Strong PUT : {sp} | Watch PUT : {wp}",
-        f"→ <b>โมเมนตัมรวม:</b> {bias}",
-        "",
-        "พอร์ตสั้นวันเดียว: ตามน้ำกลุ่ม Strong, รอจังหวะใน Watch",
-    ]
-    return "\n".join(msg)
-
-# ------------ TELEGRAM HANDLERS ------------
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "คำสั่งที่ใช้ได้\n"
-        "• /movers – ดู Top Movers (โหมดฟรี)\n"
-        "• /signals – จัดกลุ่ม Watch/Strong (CALL/PUT)\n"
-        "• /outlook – มองภาพรวมโมเมนตัม\n"
-        "• /picks – รายชื่อ pick สั้น ๆ เข้าออกวันเดียว\n"
-        "• /ping – ทดสอบบอท\n\n"
-        f"เกณฑ์: pct ≥ {MIN_PCT:.1f}%, ราคา ≥ {MIN_PRICE}, Vol ≥ {MIN_VOL}"
-    )
-    await update.message.reply_text(text)
-
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("pong ✅")
-
-async def ensure_market() -> Tuple[str, List[Dict[str, Any]], str]:
-    date_used, items, err = load_market()
-    return date_used, items, err
-
-async def cmd_movers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    m = await update.message.reply_text("⏳ กำลังดึงข้อมูลโหมดฟรีจาก Polygon...")
-    date_used, items, err = await ensure_market()
-    if err:
-        await m.edit_text(f"ขออภัย: {err}")
-        return
-    await m.edit_text(build_movers_text(date_used, items), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-
-async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    m = await update.message.reply_text("⏳ กำลังดึงข้อมูลโหมดฟรีจาก Polygon...")
-    date_used, items, err = await ensure_market()
-    if err:
-        await m.edit_text(f"ขออภัย: {err}")
-        return
-    groups = classify(items)
-    await m.edit_text(build_signals_text(date_used, groups), parse_mode=ParseMode.HTML, disable_web_page_preview=True)
-
-async def cmd_outlook(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    m = await update.message.reply_text("⏳ กำลังดึงข้อมูลโหมดฟรีจาก Polygon...")
-    date_used, items, err = await ensure_market()
-    if err:
-        await m.edit_text(f"ขออภัย: {err}")
-        return
-    groups = classify(items)
-    await m.edit_text(build_outlook_text(date_used, groups), parse_mode=ParseMode.HTML)
-
-async def cmd_picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    m = await update.message.reply_text("⏳ คัดรายการจากสัญญาณ...")
-    date_used, items, err = await ensure_market()
-    if err:
-        await m.edit_text(f"ขออภัย: {err}")
-        return
-    groups = classify(items)
-    picks = picks_from_groups(groups)
-    await m.edit_text(build_picks_text(date_used, picks), parse_mode=ParseMode.HTML)
-
-def build_app() -> Application:
-    if not BOT_TOKEN:
-        raise RuntimeError("Missing BOT_TOKEN env.")
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler(["start", "help"], cmd_help))
-    app.add_handler(CommandHandler("ping", cmd_ping))
-    app.add_handler(CommandHandler("movers", cmd_movers))
-    app.add_handler(CommandHandler("signals", cmd_signals))
-    app.add_handler(CommandHandler("outlook", cmd_outlook))
-    app.add_handler(CommandHandler("picks", cmd_picks))
-    return app
-
-tele_app: Application = build_app()
-
-# ------------ RUN TELEGRAM (LONG-POLLING IN THREAD) ------------
-def start_telegram_polling():
-    """
-    แยกเธรด+อีเวนต์ลูปใหม่ เพื่อเลี่ยง RuntimeError 'no current event loop'
-    เมื่อรันคู่กับ Flask บน Render
-    """
-    log.info("Starting telegram long-polling…")
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(
-            tele_app.run_polling(stop_signals=None, close_loop=True)
-        )
-    except Exception as e:
-        log.exception("Polling crashed")
-    finally:
-        try:
-            loop.stop()
-            loop.close()
-        except Exception:
-            pass
-
-# ------------ FLASK HEALTH (RENDER) ------------
-flask_app = Flask(__name__)
-
-@flask_app.route("/")
+@app.route("/")
 def home():
-    return "Bot is running! (health OK)"
+    return "Bot is running. ✅"
 
-# ------------ MAIN ------------
+
+# -------------------- Utils --------------------
+def _now():
+    return time.time()
+
+
+def _cache_get(key, ttl_sec):
+    with _cache_lock:
+        entry = _cache.get(key)
+        if not entry:
+            return None
+        if _now() - entry["ts"] <= ttl_sec:
+            return entry["data"]
+        # expired
+        _cache.pop(key, None)
+        return None
+
+
+def _cache_put(key, data):
+    with _cache_lock:
+        _cache[key] = {"ts": _now(), "data": data}
+
+
+def _rate_guard():
+    """Ensure we don't exceed API_MAX_CALLS_PER_MIN within 60s window."""
+    if API_MAX_CALLS_PER_MIN <= 0:
+        return
+    with _call_lock:
+        now = _now()
+        # purge older than 60s
+        while _call_times and now - _call_times[0] > 60:
+            _call_times.popleft()
+        if len(_call_times) >= API_MAX_CALLS_PER_MIN:
+            # sleep until first timestamp exits 60s window
+            wait_s = 60 - (now - _call_times[0]) + 0.2
+            if wait_s > 0:
+                time.sleep(wait_s)
+        _call_times.append(_now())
+
+
+def _fetch_json_with_retry(url, params=None, timeout=20, max_retry=3):
+    """GET with retries on 429/5xx + rate guard. Return (ok, data or error_str)."""
+    backoff = 3.0
+    for attempt in range(1, max_retry + 1):
+        _rate_guard()
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+        except Exception as e:
+            err = f"network error: {e}"
+            if attempt == max_retry:
+                return False, err
+            time.sleep(backoff)
+            backoff *= 1.8
+            continue
+
+        if r.status_code == 200:
+            try:
+                return True, r.json()
+            except Exception as e:
+                return False, f"bad json: {e}"
+
+        # 429 or server error -> backoff
+        if r.status_code in (429, 500, 502, 503, 504):
+            if attempt == max_retry:
+                # give caller a last chance to use cache
+                return False, f"HTTP {r.status_code}"
+            time.sleep(backoff)
+            backoff *= 1.8
+            continue
+
+        # other client error
+        try:
+            msg = r.json().get("message", r.text)
+        except Exception:
+            msg = r.text
+        return False, f"HTTP {r.status_code}: {msg}"
+
+
+def previous_us_trading_day(base_dt=None):
+    """Rough previous day (free mode uses 'previous calendar day' => good enough)."""
+    tz = timezone.utc
+    d = (base_dt or datetime.now(tz)).date() - timedelta(days=1)
+    return d.strftime("%Y-%m-%d")
+
+
+# -------------------- Polygon free endpoint --------------------
+def fetch_grouped_prev_day():
+    """
+    Free mode: use yesterday's grouped bars.
+    Cache key: 'grouped_prev_day::<date>'
+    """
+    date = previous_us_trading_day()
+    cache_key = f"grouped_prev_day::{date}"
+    ttl_sec = CACHE_TTL_MIN * 60
+
+    cached = _cache_get(cache_key, ttl_sec)
+    if cached is not None:
+        return True, cached, True  # (ok, data, from_cache)
+
+    url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{date}"
+    params = {"adjusted": "true", "apiKey": POLYGON_API_KEY}
+    ok, payload = _fetch_json_with_retry(url, params=params)
+    if ok and isinstance(payload, dict) and payload.get("results"):
+        _cache_put(cache_key, payload)
+        return True, payload, False
+    else:
+        # try last cached (even if expired) as graceful fallback
+        fallback = None
+        with _cache_lock:
+            fallback = _cache.get(cache_key)
+        if fallback:
+            return True, fallback["data"], True
+        return False, payload, False
+
+
+# -------------------- Business logic (simple demo rules) --------------------
+def parse_results(payload):
+    """Return list of items with fields: T (symbol), c (close), h, l, o, v, pct."""
+    items = []
+    for r in payload.get("results", []):
+        try:
+            T = r.get("T")
+            c = float(r.get("c"))
+            o = float(r.get("o"))
+            h = float(r.get("h"))
+            l = float(r.get("l"))
+            v = float(r.get("v"))
+            pct = 100.0 * (c - o) / o if o else 0.0
+        except Exception:
+            continue
+        items.append({"T": T, "c": c, "o": o, "h": h, "l": l, "v": v, "pct": pct})
+    return items
+
+
+def fmt_num(x, d=2):
+    try:
+        return f"{x:,.{d}f}"
+    except Exception:
+        return str(x)
+
+
+def movers_text(items, min_pct=10.0, min_price=0.30, min_vol=0):
+    up = [it for it in items if it["pct"] >= min_pct and it["c"] >= min_price and it["v"] >= min_vol]
+    up.sort(key=lambda x: (-x["pct"], -x["v"]))
+    lines = ["✅ Top Movers (ฟรี, ย้อนหลังวันล่าสุด)",
+             f"เกณฑ์: ≥{min_pct:.1f}% | ราคา ≥{min_price} | Vol ≥{min_vol}",
+             "📈 ขึ้นแรง:"]
+    for it in up[:30]:
+        lines.append(f"• {it['T']} @{fmt_num(it['c'])} — pct {fmt_num(it['pct'],1)}%, Vol:{fmt_num(it['v'],0)}")
+    if len(up) == 0:
+        lines.append("• (ไม่พบตามเกณฑ์)")
+    return "\n".join(lines)
+
+
+def classify_signals(items):
+    """Very simple rules to group Watch/Strong CALL/PUT by pct & close near H/L."""
+    def close_near(top, price):
+        # within 2% of top
+        return abs(top - price) <= max(0.02 * top, 1e-9)
+
+    strong_call, watch_call, strong_put, watch_put = [], [], [], []
+    for it in items:
+        T, c, o, h, l, v, pct = it["T"], it["c"], it["o"], it["h"], it["l"], it["v"], it["pct"]
+        # CALL side
+        if pct >= 10 and close_near(h, c):
+            strong_call.append(T)
+        elif pct >= 5 and close_near(h, c):
+            watch_call.append(T)
+        # PUT side
+        if pct <= -10 and close_near(l, c):
+            strong_put.append(T)
+        elif pct <= -5 and close_near(l, c):
+            watch_put.append(T)
+    return strong_call, watch_call, strong_put, watch_put
+
+
+def outlook_text(sc, wc, sp, wp):
+    lines = ["🧭 Outlook (อิงข้อมูลเมื่อวาน)",
+             f"• Strong CALL: {len(sc)} | Watch CALL: {len(wc)}",
+             f"• Strong PUT : {len(sp)} | Watch PUT : {len(wp)}"]
+    # quick view
+    bias = "กลาง"
+    if len(sc) + len(wc) > len(sp) + len(wp) + 10:
+        bias = "เอียงขึ้น"
+    elif len(sp) + len(wp) > len(sc) + len(wc) + 10:
+        bias = "เอียงลง"
+    lines.append(f"→ โมเมนตัมรวม: {bias}")
+    lines.append("")
+    lines.append("พอร์ตสั้นวันเดียว: ตามน้ำกลุ่ม Strong, รอจังหวะใน Watch")
+    return "\n".join(lines)
+
+
+# -------------------- Telegram Handlers --------------------
+def send_rate_note(context: CallbackContext, used_cache: bool, ok: bool, err=None):
+    if used_cache:
+        context.bot.send_message(
+            chat_id=context._chat_id_and_data[0],
+            text="(เปิดจากแคชล่าสุดเพื่อเลี่ยงลิมิต/429)"
+        )
+    elif not ok and isinstance(err, str) and "429" in err:
+        context.bot.send_message(
+            chat_id=context._chat_id_and_data[0],
+            text="ขออภัย: 429 (เรียกข้อมูลบ่อยเกินไป) — รอสักครู่แล้วลองอีกครั้ง หรือใช้แคชด้วยคำสั่งเดิมภายใน 10 นาที"
+        )
+
+
+def cmd_movers(update: Update, context: CallbackContext):
+    msg_wait = context.bot.send_message(chat_id=update.effective_chat.id, text="⏳ กำลังดึงข้อมูลโหมดฟรีจาก Polygon...")
+    ok, payload, from_cache = fetch_grouped_prev_day()
+    if not ok:
+        context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=msg_wait.message_id,
+                                      text=f"ขออภัย ดึงข้อมูลไม่สำเร็จ: {payload}")
+        send_rate_note(context, from_cache, ok, payload)
+        return
+    items = parse_results(payload)
+    text = movers_text(items)
+    context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=msg_wait.message_id, text=text)
+    send_rate_note(context, from_cache, ok)
+
+
+def cmd_signals(update: Update, context: CallbackContext):
+    msg_wait = context.bot.send_message(chat_id=update.effective_chat.id, text="⏳ กำลังจัดกลุ่มสัญญาณ (ฟรี, ย้อนหลังวันล่าสุด)...")
+    ok, payload, from_cache = fetch_grouped_prev_day()
+    if not ok:
+        context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=msg_wait.message_id,
+                                      text=f"ขออภัย ดึงข้อมูลไม่สำเร็จ: {payload}")
+        send_rate_note(context, from_cache, ok, payload)
+        return
+    items = parse_results(payload)
+    sc, wc, sp, wp = classify_signals(items)
+    def show(title, arr):
+        hemi = ", ".join(arr[:30]) if arr else "(ไม่มี)"
+        return f"• {title} — ตัวอย่าง: {hemi}"
+    text = "🔮 คาดการณ์แนวโน้มวันนี้ (อิงจากข้อมูลเมื่อวาน)\n" + \
+           show("Momentum ขาขึ้น: Strong CALL 30", sc) + "\n" + \
+           show("ลุ้นเบรกขึ้น: Watch CALL 30", wc) + "\n" + \
+           show("Momentum ขาลง: Strong PUT 30", sp) + "\n" + \
+           show("ระวังอ่อนแรง: Watch PUT 30", wp) + "\n\n" + \
+           "💡 แนวคิด:\n• Strong CALL มักเปิดบวก/ลุ้นทำ High ใหม่ ถ้าจ่อจุดหนุน\n" + \
+           "• Watch CALL รอเบรก High เดิม + วอลุ่มเพิ่ม\n" + \
+           "• Strong PUT ลงต่อหรือรีบาวน์สั้น\n" + \
+           "• Watch PUT ระวังหลุดแนวรับ"
+    context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=msg_wait.message_id, text=text)
+    send_rate_note(context, from_cache, ok)
+
+
+def cmd_outlook(update: Update, context: CallbackContext):
+    msg_wait = context.bot.send_message(chat_id=update.effective_chat.id, text="⏳ กำลังดึงข้อมูลโหมดฟรีจาก Polygon...")
+    ok, payload, from_cache = fetch_grouped_prev_day()
+    if not ok:
+        context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=msg_wait.message_id,
+                                      text=f"ขออภัย ดึงข้อมูลไม่สำเร็จ: {payload}")
+        send_rate_note(context, from_cache, ok, payload)
+        return
+    items = parse_results(payload)
+    sc, wc, sp, wp = classify_signals(items)
+    text = outlook_text(sc, wc, sp, wp)
+    context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=msg_wait.message_id, text=text)
+    send_rate_note(context, from_cache, ok)
+
+
+def cmd_help(update: Update, context: CallbackContext):
+    text = (
+        "👋 ยินดีต้อนรับสู่ Stock Signal Bot (โหมดฟรี)\n"
+        "คำสั่งที่ใช้ได้\n"
+        "• /movers  – ดู Top Movers (ฟรี)\n"
+        "• /signals – จัดกลุ่ม Strong/Watch (CALL/PUT)\n"
+        "• /outlook – คาดการณ์โมเมนตัมวันนี้ (อิงเมื่อวาน)\n"
+        "• /help    – ดูเมนูนี้อีกครั้ง\n\n"
+        f"เกณฑ์เบื้องต้น: pct ≥ 10.0%, ราคา ≥ 0.30, Vol ≥ 0\n"
+        f"(cache {CACHE_TTL_MIN} นาที • limit {API_MAX_CALLS_PER_MIN}/นาที)"
+    )
+    context.bot.send_message(chat_id=update.effective_chat.id, text=text)
+
+
+# -------------------- Runner --------------------
+def run_telegram_longpoll():
+    updater = Updater(BOT_TOKEN, use_context=True)
+    dp = updater.dispatcher
+
+    dp.add_handler(CommandHandler("movers", cmd_movers))
+    dp.add_handler(CommandHandler("signals", cmd_signals))
+    dp.add_handler(CommandHandler("outlook", cmd_outlook))
+    dp.add_handler(CommandHandler("help", cmd_help))
+
+    print("[info] starting telegram long-polling…")
+    updater.start_polling(drop_pending_updates=True)
+    updater.idle()
+
+
 if __name__ == "__main__":
-    # start telegram in background thread
-    Thread(target=start_telegram_polling, daemon=True).start()
+    # Start Telegram in a background thread
+    t = threading.Thread(target=run_telegram_longpoll, daemon=True)
+    t.start()
 
-    # run flask (blocking)
-    port = int(os.environ.get("PORT", "10000"))
-    flask_app.run(host="0.0.0.0", port=port)
+    # Start Flask to keep Render happy (port binding)
+    app.run(host="0.0.0.0", port=PORT, debug=False)
