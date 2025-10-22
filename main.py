@@ -1,269 +1,145 @@
 # -*- coding: utf-8 -*-
 """
-Stock-signal-bot (free mode skeleton)
-- Telegram: python-telegram-bot v20+
-- Web: Flask (for Render healthcheck / logs)
-- Run model: Telegram long-polling in a background thread + Flask main thread
-- ENV: BOT_TOKEN, POLYGON_API_KEY (optional), CHAT_ID (optional), PUBLIC_URL (optional), PORT
+Stock-signal bot (Render)
+- แยก Telegram bot ไปทำงานใน 'thread' ของมันเอง
+- Flask รันใน main thread (Render health check / หน้าสถานะ)
+- รองรับคำสั่งพื้นฐาน: /start /help /ping /movers /signals /outlook /picks
+- ใช้ PTB v20.3 + httpx 0.24.1 (ดู requirements.txt)
 """
 
 import os
-import sys
-import threading
-import asyncio
 import logging
-from datetime import datetime, timedelta, timezone
+from threading import Thread
+import asyncio
+from datetime import datetime, timezone
 
-import requests
 from flask import Flask, jsonify
 
-# =========================
-# Logging
-# =========================
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+)
+
+# ---------------------- ตั้งค่า Log ----------------------
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger("stock-signal-bot")
 
-# =========================
-# ENV
-# =========================
+# ---------------------- ENV ----------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "").strip()
-CHAT_ID = os.getenv("CHAT_ID", "").strip()  # optional broadcast
-PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip()
 PORT = int(os.getenv("PORT", "10000"))
+PUBLIC_URL = os.getenv("PUBLIC_URL", "")  # ไม่ได้ใช้ก็ได้ แต่เก็บไว้เผื่ออนาคต
 
 if not BOT_TOKEN:
-    log.warning("BOT_TOKEN is empty! Bot will not start until you set it.")
+    log.error("❌ ENV BOT_TOKEN ว่างอยู่! ใส่ค่าให้ถูกใน Render > Environment")
+    # อย่าทำ sys.exit() ปล่อยให้ Flask ขึ้นเพื่อดูข้อความเตือนในหน้าเว็บ
+else:
+    log.info("✅ BOT_TOKEN loaded (length=%s)", len(BOT_TOKEN))
 
-# =========================
-# Flask app (health / home)
-# =========================
+# ---------------------- Flask app ----------------------
 app = Flask(__name__)
 
-@app.route("/")
-def home():
-    return "Stock-signal-bot is running."
+@app.get("/")
+def root():
+    return jsonify(
+        ok=True,
+        service="stock-signal-bot",
+        now_utc=datetime.now(timezone.utc).isoformat(),
+        telegram="long-polling thread alive?"  # แค่บอกสถานะคร่าวๆ
+    )
 
-@app.route("/health")
-def health():
-    return jsonify({"ok": True, "time": datetime.utcnow().isoformat()})
-
-
-# =========================
-# Helpers
-# =========================
-def _fmt_num(x, digits=2):
-    try:
-        return f"{float(x):,.{digits}f}"
-    except Exception:
-        return str(x)
-
-def _yesterday_us():
-    # ล่าสุด “วันทำการ” ของ US (แบบหยาบ ๆ: เมื่อวาน)
-    tz = timezone.utc
-    d = datetime.now(tz) - timedelta(days=1)
-    return d.strftime("%Y-%m-%d")
-
-def fetch_polygon_grouped(date_str):
-    """
-    ดึง Top movers แบบฟรีจาก Polygon (อ้างอิงวันก่อนหน้า)
-    ถ้า key ไม่พอ/แผนฟรีไม่ผ่าน จะคืน []
-    """
-    if not POLYGON_API_KEY:
-        return []
-
-    url = f"https://api.polygon.io/v2/aggs/grouped/locale/us/market/stocks/{date_str}"
-    params = {"adjusted": "true", "apiKey": POLYGON_API_KEY}
-    try:
-        r = requests.get(url, params=params, timeout=15)
-        if r.status_code != 200:
-            log.warning("Polygon status %s: %s", r.status_code, r.text[:200])
-            return []
-        data = r.json()
-        if not isinstance(data, dict) or data.get("status") != "OK":
-            log.warning("Polygon response: %s", str(data)[:200])
-            return []
-        results = data.get("results", []) or []
-        # results: list of {T: ticker, c: close, o: open, h: high, l: low, v: volume, ...}
-        movers = []
-        for it in results:
-            t = it.get("T")
-            o = it.get("o")
-            c = it.get("c")
-            v = it.get("v")
-            if t is None or o in (None, 0) or c is None:
-                continue
-            pct = (c - o) / o * 100.0
-            movers.append({
-                "ticker": t,
-                "open": o,
-                "close": c,
-                "pct": pct,
-                "vol": v,
-                "high": it.get("h"),
-                "low": it.get("l"),
-            })
-        # เรียงตาม % เปลี่ยนแปลงมากสุด
-        movers.sort(key=lambda x: abs(x["pct"]), reverse=True)
-        return movers
-    except Exception as e:
-        log.exception("fetch_polygon_grouped error: %s", e)
-        return []
-
-
-def build_movers_text(movers, limit=20, min_price=0.3, min_pct=10.0, min_vol=0):
-    if not movers:
-        return "ยังไม่มีข้อมูล (โหมดฟรี: ต้องรอดึงวันทำการล่าสุดจาก Polygon)\nลองใหม่อีกครั้ง /movers"
-    lines = []
-    lines.append("✅ Top Movers (ฟรี, ย้อนหลังวันล่าสุด)")
-    lines.append(f"เกณฑ์: ≥{_fmt_num(min_pct,1)}% | ราคา ≥{min_price} | Vol ≥{min_vol}")
-    lines.append("📈 ขึ้นแรง:")
-    cnt = 0
-    for m in movers:
-        if m["pct"] >= min_pct and m["close"] >= min_price and (m["vol"] or 0) >= min_vol:
-            lines.append(f"• {m['ticker']} @{_fmt_num(m['close'])} — pct +{_fmt_num(m['pct'],1)}%, Vol {_fmt_num(m['vol'],0)}")
-            cnt += 1
-            if cnt >= limit:
-                break
-    if cnt == 0:
-        lines.append("• (ไม่พบที่ตรงเกณฑ์)")
-    return "\n".join(lines)
-
-
-def classify_signals(movers):
-    """
-    แยกกลุ่มสัญญาณแบบง่าย:
-      - Strong CALL: pct >= +15% และปิดใกล้ High
-      - Watch CALL : pct >= +7%
-      - Strong PUT : pct <= -15% และปิดใกล้ Low
-      - Watch PUT  : pct <= -7%
-    (เป็นตัวอย่างเบื้องต้น สามารถปรับสูตรทีหลังได้)
-    """
-    if not movers:
-        return {"sc": [], "wc": [], "sp": [], "wp": []}
-
-    sc, wc, sp, wp = [], [], [], []
-    for m in movers:
-        c, h, l = m["close"], m.get("high"), m.get("low")
-        pct = m["pct"]
-        near_high = (h is not None and h != 0 and abs(h - c) <= max(0.02*h, 0.02))  # ~ใกล้ high
-        near_low  = (l is not None and l != 0 and abs(c - l) <= max(0.02*l, 0.02))  # ~ใกล้ low
-
-        if pct >= 15.0 and near_high:
-            sc.append(m["ticker"])
-        elif pct >= 7.0:
-            wc.append(m["ticker"])
-        elif pct <= -15.0 and near_low:
-            sp.append(m["ticker"])
-        elif pct <= -7.0:
-            wp.append(m["ticker"])
-
-    return {"sc": sc[:30], "wc": wc[:30], "sp": sp[:30], "wp": wp[:30]}
-
-def build_signals_text(movers):
-    if not movers:
-        return "ยังไม่มีข้อมูลสัญญาณ (โหมดฟรีต้องรอดึงข้อมูลวันล่าสุด)\nพิมพ์ /movers เพื่อลองดูรายการ"
-    g = classify_signals(movers)
-    lines = []
-    lines.append("🧠 คาดการณ์แนวโน้มวันนี้ (อิงจากข้อมูลเมื่อวาน)")
-    lines.append(f"• Momentum ขาขึ้น: Strong CALL {len(g['sc'])} — ตัวอย่าง: {', '.join(g['sc'][:12]) or '-'}")
-    lines.append(f"• ลุ้นเบรกขึ้น: Watch CALL {len(g['wc'])} — ตัวอย่าง: {', '.join(g['wc'][:12]) or '-'}")
-    lines.append(f"• Momentum ขาลง: Strong PUT {len(g['sp'])} — ตัวอย่าง: {', '.join(g['sp'][:12]) or '-'}")
-    lines.append(f"• ระวังอ่อนแรง: Watch PUT {len(g['wp'])} — ตัวอย่าง: {', '.join(g['wp'][:12]) or '-'}")
-    lines.append("")
-    lines.append("💡 แนวคิด:")
-    lines.append("• Strong CALL มักเปิดบวก/ลุ้นทำ High ใหม่ ถ้าจ่อจุดหนุน")
-    lines.append("• Watch CALL รอเบรก High เดิม + วอลุ่มเพิ่ม")
-    lines.append("• Strong PUT ลงต่อหรือรีบาวน์สั้น")
-    lines.append("• Watch PUT ระวังหลุดแนวรับ")
-    return "\n".join(lines)
-
-
-# =========================
-# Telegram (v20+)
-# =========================
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+# ---------------------- Telegram Handlers ----------------------
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "สวัสดีครับ! พิมพ์ /help เพื่อดูคำสั่งที่ใช้ได้ 😊"
+    )
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "👋 คำสั่งที่ใช้ได้\n"
-        "/movers – ดู Top Movers (ฟรี: ข้อมูลวันก่อนหน้า)\n"
-        "/signals – จัดกลุ่ม Strong/Watch (CALL/PUT) จาก movers\n"
-        "/outlook – สรุปแนวมาตลาดวันนี้ (อิงเมื่อวาน)\n"
-        "/help – เมนูนี้อีกครั้ง\n\n"
-        "เกณฑ์เริ่มต้น: pct ≥ 10.0%, ราคา ≥ 0.30, Vol ≥ 0"
+        "คำสั่งที่ใช้ได้:\n"
+        "• /ping – ทดสอบบอท\n"
+        "• /movers – Top movers (เดโม)\n"
+        "• /signals – จัดกลุ่มสัญญาณ (เดโม)\n"
+        "• /outlook – มุมมองวันนี้ (เดโม)\n"
+        "• /picks – หุ้นน่าสนใจ (เดโม)\n"
     )
     await update.message.reply_text(text)
+
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("pong ✅")
 
 async def cmd_movers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ กำลังดึงข้อมูลโหมดฟรีจาก Polygon...")
-    date_ref = _yesterday_us()
-    movers = fetch_polygon_grouped(date_ref)
-    text = build_movers_text(movers, limit=30, min_price=0.30, min_pct=10.0, min_vol=0)
-    await update.message.reply_text(text)
+    await update.message.reply_text("📈 movers (เดโม) – ระบบตอบกลับได้ปกติแล้ว")
 
 async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ กำลังคัดกลุ่มสัญญาณจาก movers (ฟรี: ย้อนหลังวันล่าสุด)...")
-    date_ref = _yesterday_us()
-    movers = fetch_polygon_grouped(date_ref)
-    text = build_signals_text(movers)
-    await update.message.reply_text(text)
+    await update.message.reply_text("🧭 signals (เดโม) – ระบบตอบกลับได้ปกติแล้ว")
 
 async def cmd_outlook(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    date_ref = _yesterday_us()
-    movers = fetch_polygon_grouped(date_ref)
-    g = classify_signals(movers)
-    text = (
-        f"📟 Outlook (อิง {date_ref})\n"
-        f"• Strong CALL: {len(g['sc'])} | Watch CALL: {len(g['wc'])}\n"
-        f"• Strong PUT : {len(g['sp'])} | Watch PUT : {len(g['wp'])}\n"
-        f"→ โมเมนตัมรวม: "
-        f"{'ขาขึ้น' if len(g['sc'])+len(g['wc']) > len(g['sp'])+len(g['wp']) else 'ขาลง' if len(g['sp'])+len(g['wp']) > len(g['sc'])+len(g['wc']) else 'กลาง'}\n\n"
-        "พอร์ตสั้นวันเดียว: ตามน้ำกลุ่ม Strong, รอจังหวะใน Watch"
-    )
-    await update.message.reply_text(text)
+    await update.message.reply_text("🔭 outlook (เดโม) – ระบบตอบกลับได้ปกติแล้ว")
 
-def build_telegram_app():
+async def cmd_picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("🎯 picks (เดโม) – ระบบตอบกลับได้ปกติแล้ว")
+
+# ---------------------- ตัวบอท (async) ----------------------
+async def build_app():
     if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is not set.")
+        log.error("BOT_TOKEN ไม่พร้อม จึงยังไม่ start telegram app")
+        return None
+
     app_tg = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    app_tg.add_handler(CommandHandler("help",    cmd_help))
-    app_tg.add_handler(CommandHandler("start",   cmd_help))
-    app_tg.add_handler(CommandHandler("movers",  cmd_movers))
+    # register handlers
+    app_tg.add_handler(CommandHandler("start", cmd_start))
+    app_tg.add_handler(CommandHandler("help", cmd_help))
+    app_tg.add_handler(CommandHandler("ping", cmd_ping))
+    app_tg.add_handler(CommandHandler("movers", cmd_movers))
     app_tg.add_handler(CommandHandler("signals", cmd_signals))
     app_tg.add_handler(CommandHandler("outlook", cmd_outlook))
+    app_tg.add_handler(CommandHandler("picks", cmd_picks))
+
+    # ลอง getMe เพื่อ log ให้เห็นว่า token ใช้ได้จริง
+    me = await app_tg.bot.get_me()
+    log.info("🤖 Authorized as @%s (id=%s)", me.username, me.id)
 
     return app_tg
 
 async def run_telegram():
-    app_tg = build_telegram_app()
-    log.info("Starting telegram long-polling…")
-    await app_tg.run_polling(stop_signals=None)  # เราจัดการหยุดเองเมื่อโปรเซสตาย
+    """
+    รันบอทแบบ long-polling ใน event loop ของเธรดนี้
+    ใช้ asyncio.run(run_telegram()) เมื่อสตาร์ทเธรด
+    """
+    app_tg = await build_app()
+    if app_tg is None:
+        return
 
+    log.info("🚀 Starting telegram long-polling…")
+    # ไม่ต้องกำหนด stop_signals เพื่อหลีกเลี่ยงการปิด loop ผิดที่
+    await app_tg.run_polling(close_loop=False)
 
-# =========================
-# ENTRYPOINT (Thread approach)
-# =========================
-if __name__ == "__main__":
-    # รัน Telegram bot ใน thread แยก เพื่อหลีกเลี่ยงปัญหา event-loop บนบางสภาพแวดล้อม (เช่น Render)
-    def _bot_runner():
+def start_telegram_thread():
+    """
+    สร้างเธรดใหม่แล้วรัน asyncio.run(run_telegram())
+    แยกจาก main thread ที่ใช้รัน Flask
+    """
+    def _target():
         try:
             asyncio.run(run_telegram())
         except Exception as e:
-            log.exception("Telegram runner crashed: %s", e)
+            log.exception("❌ Telegram thread crashed: %s", e)
 
-    if BOT_TOKEN:
-        t = threading.Thread(target=_bot_runner, daemon=True)
-        t.start()
-        log.info("🚀 Flask + Telegram bot started together")
-    else:
-        log.warning("🚫 BOT not started because BOT_TOKEN is missing")
+    th = Thread(target=_target, name="telegram-thread", daemon=True)
+    th.start()
+    log.info("🧵 started telegram-thread")
 
-    # รัน Flask เป็น process หลัก
+# ---------------------- Entry point ----------------------
+if __name__ == "__main__":
+    # สตาร์ท Telegram ในเธรดแยก
+    start_telegram_thread()
+
+    # แล้วค่อยเปิด Flask (เธรดหลัก)
+    log.info("🌐 Starting Flask on 0.0.0.0:%s", PORT)
     app.run(host="0.0.0.0", port=PORT, debug=False)
