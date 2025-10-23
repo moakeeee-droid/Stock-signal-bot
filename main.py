@@ -38,7 +38,6 @@ def fetch_trending_symbols(limit: int = 10) -> List[str]:
         return symbols[:limit]
     except Exception as e:
         log.warning(f"fetch_trending_symbols failed: {e}")
-        # fallback กลุ่มตัวอย่าง
         return ["AAPL", "NVDA", "TSLA", "AMZN", "MSFT", "META"]
 
 def fetch_quotes(symbols: List[str]) -> Dict[str, Dict[str, Any]]:
@@ -97,7 +96,6 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(txt)
 
 def simple_signal_label(q: Dict[str, Any]) -> str:
-    """สัญญาณจำลองง่าย ๆ จาก %chg และ Vol"""
     chg = (q.get("regularMarketChangePercent") or 0.0)
     vol = (q.get("regularMarketVolume") or 0)
     avgv = (q.get("averageDailyVolume3Month") or 1)
@@ -128,7 +126,6 @@ async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_markdown(msg)
 
 async def outlook(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # เอาง่าย ๆ: ดูภาพรวมจาก %chg ของ trending เฉลี่ย
     syms = fetch_trending_symbols(limit=30)
     quotes = fetch_quotes(syms).values()
     if not quotes:
@@ -139,14 +136,12 @@ async def outlook(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🧭 Outlook วันนี้: {mood}")
 
 async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # เลือก top movers จาก trending 12 ตัว
     syms = fetch_trending_symbols(limit=12)
     qmap = fetch_quotes(syms)
     if not qmap:
         await update.message.reply_text("ยังดึงข้อมูลหุ้นไม่ได้ ลองอีกครั้งครับ")
         return
 
-    # จัดอันดับตาม %chg มากสุด 3 ตัว
     top = sorted(qmap.values(), key=lambda x: x.get("regularMarketChangePercent") or 0, reverse=True)[:3]
     txt_blocks = [format_stock_card(q) for q in top]
     msg = "📝 *Picks วันนี้* (จาก Yahoo)\n" + "\n\n".join(txt_blocks)
@@ -168,16 +163,7 @@ def build_app():
     return app
 
 async def run_webhook():
-    """
-    ใช้ webhook server ของ PTB เอง (aiohttp)
-    ต้องตั้ง env บน Render:
-      - BOT_TOKEN
-      - PUBLIC_URL = https://<your-service>.onrender.com
-      - PORT (เช่น 10000)  --> Render จะ set ให้เป็น PORT อัตโนมัติอยู่แล้ว
-      - WEBHOOK_PATH (เช่น /webhook)
-    """
     app = build_app()
-
     port = int(os.environ.get("PORT", "10000"))
     public_url = os.environ.get("PUBLIC_URL", "").rstrip("/")
     webhook_path = os.environ.get("WEBHOOK_PATH", "/webhook")
@@ -185,19 +171,25 @@ async def run_webhook():
     if not public_url.startswith("http"):
         raise RuntimeError("PUBLIC_URL ต้องเป็น URL เต็ม เช่น https://stock-signal-bot-1.onrender.com")
 
-    log.info(f"Starting in WEBHOOK mode | PORT={port} | PUBLIC_URL={public_url} | WEBHOOK_PATH={webhook_path}")
+    log.info(f"Starting in WEBHOOK mode | PORT={port} | PUBLIC_URL={public_url}{webhook_path}")
 
-    # ตั้งค่า webhook (PTB จะเปิด aiohttp ที่ 0.0.0.0:PORT ให้)
     await app.run_webhook(
         listen="0.0.0.0",
         port=port,
         webhook_url=f"{public_url}{webhook_path}",
-        # อย่าปิด event loop หลังเริ่ม (ให้รันตลอด)
-        close_loop=False,
     )
 
 def main():
-    asyncio.run(run_webhook())
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            log.warning("Existing event loop detected — using create_task instead of asyncio.run")
+            loop.create_task(run_webhook())
+            loop.run_forever()
+        else:
+            loop.run_until_complete(run_webhook())
+    except RuntimeError:
+        asyncio.run(run_webhook())
 
 if __name__ == "__main__":
     main()
