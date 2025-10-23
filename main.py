@@ -1,77 +1,57 @@
 import os
-import asyncio
 import logging
-import threading
-from flask import Flask
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from flask import Flask, request
 from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ---------------- Logging ----------------
+# ============== CONFIG ==============
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+PORT = int(os.getenv("PORT", "10000"))
+PUBLIC_URL = os.getenv("PUBLIC_URL", "https://stock-signal-bot-1.onrender.com")
+WEBHOOK_PATH = "/webhook"
+
+# ============== LOGGING ==============
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
-log = logging.getLogger("stock-signal-bot")
+logger = logging.getLogger(__name__)
 
-# ---------------- Flask ----------------
-flask_app = Flask(__name__)
+# ============== FLASK APP ==============
+app = Flask(__name__)
 
-@flask_app.route("/")
+@app.route("/")
 def home():
-    return "✅ Stock Signal Bot is running!", 200
+    return "✅ Stock Signal Bot is running!"
 
-# ---------------- Telegram ----------------
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-PUBLIC_URL = os.environ.get("PUBLIC_URL", "").strip()
-WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "/webhook")
-PORT = int(os.environ.get("PORT", "10000"))
+@app.route(WEBHOOK_PATH, methods=["POST"])
+async def webhook():
+    update = Update.de_json(request.get_json(force=True), bot_app.bot)
+    await bot_app.process_update(update)
+    return "OK", 200
 
+# ============== TELEGRAM BOT ==============
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("ยินดีต้อนรับสู่ Stock Signal Bot 📊")
-
-async def ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("pong 🏓")
+    await update.message.reply_text("สวัสดีครับ! บอทพร้อมทำงานแล้ว 📈")
 
 async def signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📈 ตัวอย่างสัญญาณ: Strong CALL 12 | Strong PUT 8")
-
-async def outlook(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🌤️ Outlook วันนี้: โมเมนตัมกลาง ๆ")
-
-async def picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("💡 Picks: AAPL, NVDA, TSLA")
-
-def build_bot():
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("ping", ping))
-    app.add_handler(CommandHandler("signals", signals))
-    app.add_handler(CommandHandler("outlook", outlook))
-    app.add_handler(CommandHandler("picks", picks))
-    return app
-
-def run_flask():
-    log.info(f"🌐 Flask running on port {PORT}")
-    flask_app.run(host="0.0.0.0", port=PORT)
-
-async def run_webhook(bot_app):
-    webhook_url = f"{PUBLIC_URL}{WEBHOOK_PATH}"
-    log.info(f"🚀 Setting Telegram webhook to: {webhook_url}")
-    await bot_app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        webhook_url=webhook_url,
-        stop_signals=None
-    )
+    await update.message.reply_text("กำลังประมวลผลสัญญาณหุ้นล่าสุดครับ 🔍")
 
 def main():
-    # Start Flask in a background thread
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
+    global bot_app
 
-    # Run Telegram bot webhook (new event loop)
-    bot_app = build_bot()
-    asyncio.run(run_webhook(bot_app))
+    bot_app = Application.builder().token(BOT_TOKEN).build()
+    bot_app.add_handler(CommandHandler("start", start))
+    bot_app.add_handler(CommandHandler("signals", signals))
 
+    # ตั้งค่า webhook URL
+    webhook_url = f"{PUBLIC_URL}{WEBHOOK_PATH}"
+    logger.info(f"Setting webhook to: {webhook_url}")
+
+    # ใช้ event loop เดียว (ไม่ใช้ asyncio.run ซ้ำ)
+    loop = bot_app.run_polling(close_loop=False)  # เผื่อ fallback polling ถ้า render ปิด port
+
+# ============== RUN FLASK SERVER ==============
 if __name__ == "__main__":
+    logger.info("Starting Flask & Telegram bot (Webhook mode)")
+    app.run(host="0.0.0.0", port=PORT)
     main()
