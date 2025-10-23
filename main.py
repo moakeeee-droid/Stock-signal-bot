@@ -177,19 +177,17 @@ async def run_webhook():
         listen="0.0.0.0",
         port=port,
         webhook_url=f"{public_url}{webhook_path}",
+        close_loop=False,  # 👈 ป้องกันไม่ให้ปิด loop
     )
 
 def main():
+    loop = asyncio.get_event_loop()
     try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            log.warning("Existing event loop detected — using create_task instead of asyncio.run")
-            loop.create_task(run_webhook())
-            loop.run_forever()
-        else:
-            loop.run_until_complete(run_webhook())
+        loop.run_until_complete(run_webhook())
     except RuntimeError:
-        asyncio.run(run_webhook())
+        log.warning("Event loop already running, use create_task fallback.")
+        loop.create_task(run_webhook())
+        loop.run_forever()
 
 if __name__ == "__main__":
     main()
