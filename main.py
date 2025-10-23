@@ -2,7 +2,7 @@ import os
 import asyncio
 import threading
 import logging
-from datetime import datetime, time
+from datetime import datetime
 import requests
 from flask import Flask, jsonify
 from telegram import Update
@@ -26,20 +26,20 @@ TZ = os.getenv("TZ", "Asia/Bangkok")
 PICKS = [s.strip().upper() for s in os.getenv("PICKS", "BYND, KUKE, GSIT").split(",")]
 
 # ─────────────────────────────
-# Flask (start immediately)
+# Flask (Render health check)
 # ─────────────────────────────
 app = Flask(__name__)
 
 @app.route("/")
-def index():
+def home():
     return jsonify({
         "status": "ok",
-        "message": "Stock Signal Bot is running",
+        "message": "Stock Signal Bot is live",
         "time_utc": datetime.utcnow().isoformat()
     })
 
 def start_flask():
-    log.info(f"🌐 Flask starting on 0.0.0.0:{PORT}")
+    log.info(f"🌐 Flask running on 0.0.0.0:{PORT}")
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
 
 # ─────────────────────────────
@@ -59,8 +59,8 @@ def get_stock_detail(symbol: str) -> str:
         wklo = q.get("fiftyTwoWeekLow", 0)
         mcap = q.get("marketCap", 0)
         link = f"https://finance.yahoo.com/quote/{symbol}"
-
         arrow = "🟢" if chg > 0 else ("🔴" if chg < 0 else "⚪")
+
         return (
             f"{arrow} *{symbol}*  ราคา {price:.2f} ({chg:+.2f} | {pct:+.2f}%)\n"
             f"Day {lo:.2f} → {hi:.2f} | 52W {wklo:.2f} → {wkhi:.2f}\n"
@@ -102,19 +102,25 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def start_telegram():
     try:
-        app_tg = ApplicationBuilder().token(BOT_TOKEN).build()
-        app_tg.add_handler(CommandHandler("ping", cmd_ping))
-        app_tg.add_handler(CommandHandler("signals", cmd_signals))
-        app_tg.add_handler(CommandHandler("outlook", cmd_outlook))
-        app_tg.add_handler(CommandHandler("picks", cmd_picks))
-        app_tg.add_handler(CommandHandler("help", cmd_help))
-        log.info("✅ Starting Telegram polling ...")
-        asyncio.run(app_tg.run_polling(close_loop=False))
+        async def runner():
+            app_tg = ApplicationBuilder().token(BOT_TOKEN).build()
+            app_tg.add_handler(CommandHandler("ping", cmd_ping))
+            app_tg.add_handler(CommandHandler("signals", cmd_signals))
+            app_tg.add_handler(CommandHandler("outlook", cmd_outlook))
+            app_tg.add_handler(CommandHandler("picks", cmd_picks))
+            app_tg.add_handler(CommandHandler("help", cmd_help))
+            log.info("✅ Starting Telegram polling ...")
+            await app_tg.run_polling(close_loop=False)
+
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(runner())
+
     except Exception as e:
         log.error(f"❌ Telegram bot failed: {e}")
 
 # ─────────────────────────────
-# Run both (Flask first)
+# Run both
 # ─────────────────────────────
 if __name__ == "__main__":
     threading.Thread(target=start_telegram, daemon=True).start()
