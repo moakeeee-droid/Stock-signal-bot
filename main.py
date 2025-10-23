@@ -209,33 +209,33 @@ async def health(request):
 
 
 # ===============================
-# MAIN (Webhook mode)
+# MAIN (safe loop version)
 # ===============================
 async def main():
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", cmd_start))
     application.add_handler(CommandHandler("signals", cmd_signals))
 
-    # run Telegram webhook
     webhook_url = f"{PUBLIC_URL}{WEBHOOK_PATH}"
-    asyncio.create_task(application.run_webhook(
+
+    # Telegram bot task
+    bot_task = application.run_webhook(
         listen="0.0.0.0",
         port=PORT,
         webhook_url=webhook_url,
         drop_pending_updates=True,
-    ))
+    )
 
-    # health check
+    # Healthcheck task
     app = web.Application()
     app.router.add_get("/", health)
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
+    web_task = site.start()
 
-    log.info(f"✅ Service is live at {PUBLIC_URL} | port={PORT}")
-    while True:
-        await asyncio.sleep(3600)
+    log.info(f"✅ Service live at {PUBLIC_URL} on port {PORT}")
+    await asyncio.gather(bot_task, web_task)
 
 
 if __name__ == "__main__":
