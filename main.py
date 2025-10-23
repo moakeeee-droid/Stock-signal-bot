@@ -22,11 +22,10 @@ log = logging.getLogger("stock-signal-bot")
 # ─────────────────────────────
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", "10000"))
-TZ = os.getenv("TZ", "Asia/Bangkok")
 PICKS = [s.strip().upper() for s in os.getenv("PICKS", "BYND, KUKE, GSIT").split(",")]
 
 # ─────────────────────────────
-# Flask (Render health check)
+# Flask (background thread)
 # ─────────────────────────────
 app = Flask(__name__)
 
@@ -34,7 +33,7 @@ app = Flask(__name__)
 def home():
     return jsonify({
         "status": "ok",
-        "message": "Stock Signal Bot is live",
+        "message": "Stock Signal Bot is running",
         "time_utc": datetime.utcnow().isoformat()
     })
 
@@ -72,7 +71,7 @@ def get_stock_detail(symbol: str) -> str:
         return f"⚠️ {symbol}: ข้อมูลไม่พร้อม"
 
 # ─────────────────────────────
-# Telegram bot
+# Telegram commands
 # ─────────────────────────────
 async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong 🏓")
@@ -100,28 +99,22 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text)
 
-def start_telegram():
-    try:
-        async def runner():
-            app_tg = ApplicationBuilder().token(BOT_TOKEN).build()
-            app_tg.add_handler(CommandHandler("ping", cmd_ping))
-            app_tg.add_handler(CommandHandler("signals", cmd_signals))
-            app_tg.add_handler(CommandHandler("outlook", cmd_outlook))
-            app_tg.add_handler(CommandHandler("picks", cmd_picks))
-            app_tg.add_handler(CommandHandler("help", cmd_help))
-            log.info("✅ Starting Telegram polling ...")
-            await app_tg.run_polling(close_loop=False)
-
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(runner())
-
-    except Exception as e:
-        log.error(f"❌ Telegram bot failed: {e}")
-
 # ─────────────────────────────
-# Run both
+# Main entry
 # ─────────────────────────────
 if __name__ == "__main__":
-    threading.Thread(target=start_telegram, daemon=True).start()
-    start_flask()
+    # Start Flask first (background thread)
+    threading.Thread(target=start_flask, daemon=True).start()
+
+    # Start Telegram bot in main thread
+    try:
+        app_tg = ApplicationBuilder().token(BOT_TOKEN).build()
+        app_tg.add_handler(CommandHandler("ping", cmd_ping))
+        app_tg.add_handler(CommandHandler("signals", cmd_signals))
+        app_tg.add_handler(CommandHandler("outlook", cmd_outlook))
+        app_tg.add_handler(CommandHandler("picks", cmd_picks))
+        app_tg.add_handler(CommandHandler("help", cmd_help))
+        log.info("✅ Starting Telegram polling (main thread)...")
+        app_tg.run_polling()
+    except Exception as e:
+        log.error(f"❌ Telegram bot failed: {e}")
