@@ -1,20 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-Stock-signal bot (Render)
-- แยก Telegram bot ไปทำงานใน 'thread' ของมันเอง
-- Flask รันใน main thread (Render health check / หน้าสถานะ)
-- รองรับคำสั่งพื้นฐาน: /start /help /ping /movers /signals /outlook /picks
-- ใช้ PTB v20.3 + httpx 0.24.1 (ดู requirements.txt)
+Stock Signal Bot (Render + Telegram long-polling)
+- รองรับ python-telegram-bot หลายเวอร์ชัน (>=20.x ถึง 21.x) ด้วยการตรวจ args ของ run_polling
+- ใช้ Flask เป็น health page
+- คำสั่งพร้อมใช้: /help /ping /movers /signals /outlook /picks
+  (ตอนนี้ดึงข้อมูลแบบ placeholder เพื่อลงได้ชัวร์ คุณค่อยต่อ API ภายหลังได้)
 """
 
 import os
 import logging
-from threading import Thread
 import asyncio
-from datetime import datetime, timezone
+import inspect
+import threading
+from datetime import datetime
 
-from flask import Flask, jsonify
+from flask import Flask, request
 
+# --- python-telegram-bot (PTB) imports (v20+ / v21+) ---
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -22,124 +24,151 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# ---------------------- ตั้งค่า Log ----------------------
+# =========================
+# Config & Logging
+# =========================
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+PUBLIC_URL = os.getenv("PUBLIC_URL", "").strip()  # ไม่ได้ใช้ก็ได้
+PORT = int(os.getenv("PORT", "10000"))
+
+if not BOT_TOKEN:
+    raise RuntimeError("ไม่ได้ตั้งค่า BOT_TOKEN ใน Render Environment")
+
 logging.basicConfig(
-    level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=logging.INFO,
 )
 log = logging.getLogger("stock-signal-bot")
 
-# ---------------------- ENV ----------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
-PORT = int(os.getenv("PORT", "10000"))
-PUBLIC_URL = os.getenv("PUBLIC_URL", "")  # ไม่ได้ใช้ก็ได้ แต่เก็บไว้เผื่ออนาคต
+# =========================
+# Flask app (health page)
+# =========================
+flask_app = Flask(__name__)
 
-if not BOT_TOKEN:
-    log.error("❌ ENV BOT_TOKEN ว่างอยู่! ใส่ค่าให้ถูกใน Render > Environment")
-    # อย่าทำ sys.exit() ปล่อยให้ Flask ขึ้นเพื่อดูข้อความเตือนในหน้าเว็บ
-else:
-    log.info("✅ BOT_TOKEN loaded (length=%s)", len(BOT_TOKEN))
+@flask_app.get("/")
+def index():
+    return "OK - stock-signal-bot", 200
 
-# ---------------------- Flask app ----------------------
-app = Flask(__name__)
+@flask_app.get("/healthz")
+def health():
+    return {"status": "ok", "time": datetime.utcnow().isoformat()}, 200
 
-@app.get("/")
-def root():
-    return jsonify(
-        ok=True,
-        service="stock-signal-bot",
-        now_utc=datetime.now(timezone.utc).isoformat(),
-        telegram="long-polling thread alive?"  # แค่บอกสถานะคร่าวๆ
+# =========================
+# Telegram handlers
+# =========================
+HELP_TEXT = (
+    "คำสั่งที่ใช้ได้:\n"
+    "• /ping – ทดสอบบอท\n"
+    "• /help – เมนูนี้\n"
+    "• /movers – (ตัวอย่าง) Top movers วันนี้\n"
+    "• /signals – (ตัวอย่าง) จัดกลุ่ม Strong/Watch CALL/PUT\n"
+    "• /outlook – (ตัวอย่าง) สรุปโมเมนตัมวันนี้\n"
+    "• /picks – (ตัวอย่าง) รายชื่อที่น่าจับตา\n"
+    "\n*หมายเหตุ:* ตอนนี้ข้อมูลเป็นตัวอย่างไว้ให้บอททำงานได้ก่อน "
+    "ถ้าจะต่อ API จริงให้เพิ่มในฟังก์ชัน fetch_* ภายในไฟล์นี้ครับ"
+)
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT)
+
+async def cmd_ping(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("pong 🏓")
+
+# --------- ตัวอย่างดึงข้อมูล (ยังเป็น placeholder) ----------
+def fetch_movers() -> str:
+    # TODO: ต่อ API จริงภายหลัง (เช่น Polygon/อื่น ๆ)
+    return (
+        "📈 Top Movers (ตัวอย่าง)\n"
+        "• ABC @1.23 — pct 18.7%, Vol 12.3M (near H)\n"
+        "• XYZ @0.75 — pct -24.1%, Vol 4.5M (near L)\n"
     )
 
-# ---------------------- Telegram Handlers ----------------------
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "สวัสดีครับ! พิมพ์ /help เพื่อดูคำสั่งที่ใช้ได้ 😊"
+def fetch_signals() -> str:
+    return (
+        "🔮 Signals (ตัวอย่าง)\n"
+        "• Strong CALL: 15 | Watch CALL: 28\n"
+        "• Strong PUT : 22 | Watch PUT : 30\n"
+        "→ โมเมนตัมรวม: กลาง\n"
     )
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "คำสั่งที่ใช้ได้:\n"
-        "• /ping – ทดสอบบอท\n"
-        "• /movers – Top movers (เดโม)\n"
-        "• /signals – จัดกลุ่มสัญญาณ (เดโม)\n"
-        "• /outlook – มุมมองวันนี้ (เดโม)\n"
-        "• /picks – หุ้นน่าสนใจ (เดโม)\n"
+def fetch_outlook() -> str:
+    return (
+        "🧭 Outlook (ตัวอย่าง)\n"
+        "พอร์ตสั้นวันเดียว: ตามน้ำกลุ่ม Strong, รอจังหวะใน Watch\n"
     )
-    await update.message.reply_text(text)
 
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("pong ✅")
+def fetch_picks() -> str:
+    return (
+        "📝 Picks (ตัวอย่าง)\n"
+        "• BYND, KUKE, CIIT, GSIT, NVTX\n"
+        "• ถ้าหลุดแนวรับให้คัทสั้น ๆ\n"
+    )
 
-async def cmd_movers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("📈 movers (เดโม) – ระบบตอบกลับได้ปกติแล้ว")
+async def cmd_movers(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(fetch_movers())
 
-async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🧭 signals (เดโม) – ระบบตอบกลับได้ปกติแล้ว")
+async def cmd_signals(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(fetch_signals())
 
-async def cmd_outlook(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🔭 outlook (เดโม) – ระบบตอบกลับได้ปกติแล้ว")
+async def cmd_outlook(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(fetch_outlook())
 
-async def cmd_picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🎯 picks (เดโม) – ระบบตอบกลับได้ปกติแล้ว")
+async def cmd_picks(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(fetch_picks())
 
-# ---------------------- ตัวบอท (async) ----------------------
-async def build_app():
-    if not BOT_TOKEN:
-        log.error("BOT_TOKEN ไม่พร้อม จึงยังไม่ start telegram app")
-        return None
-
+# =========================
+# Build Telegram app
+# =========================
+def build_tg_app():
     app_tg = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # register handlers
-    app_tg.add_handler(CommandHandler("start", cmd_start))
     app_tg.add_handler(CommandHandler("help", cmd_help))
+    app_tg.add_handler(CommandHandler("start", cmd_help))
     app_tg.add_handler(CommandHandler("ping", cmd_ping))
+
     app_tg.add_handler(CommandHandler("movers", cmd_movers))
     app_tg.add_handler(CommandHandler("signals", cmd_signals))
     app_tg.add_handler(CommandHandler("outlook", cmd_outlook))
     app_tg.add_handler(CommandHandler("picks", cmd_picks))
 
-    # ลอง getMe เพื่อ log ให้เห็นว่า token ใช้ได้จริง
-    me = await app_tg.bot.get_me()
-    log.info("🤖 Authorized as @%s (id=%s)", me.username, me.id)
-
     return app_tg
 
+# =========================
+# Long-polling runner (compat)
+# =========================
 async def run_telegram():
-    """
-    รันบอทแบบ long-polling ใน event loop ของเธรดนี้
-    ใช้ asyncio.run(run_telegram()) เมื่อสตาร์ทเธรด
-    """
-    app_tg = await build_app()
-    if app_tg is None:
-        return
+    app_tg = build_tg_app()
+    log.info("Starting telegram long-polling…")
 
-    log.info("🚀 Starting telegram long-polling…")
-    # ไม่ต้องกำหนด stop_signals เพื่อหลีกเลี่ยงการปิด loop ผิดที่
-    await app_tg.run_polling(close_loop=False, handle_signals=False)
+    # ตรวจว่าฟังก์ชัน run_polling รองรับ args อะไรบ้าง (กันพังกข้ามเวอร์ชัน)
+    sig = inspect.signature(app_tg.run_polling).parameters
+    kwargs = {}
+    if "close_loop" in sig:
+        kwargs["close_loop"] = False
+    if "handle_signals" in sig:
+        kwargs["handle_signals"] = False
+
+    await app_tg.run_polling(**kwargs)
 
 def start_telegram_thread():
-    """
-    สร้างเธรดใหม่แล้วรัน asyncio.run(run_telegram())
-    แยกจาก main thread ที่ใช้รัน Flask
-    """
+    # รัน asyncio แยกเธรด
     def _target():
         try:
             asyncio.run(run_telegram())
         except Exception as e:
-            log.exception("❌ Telegram thread crashed: %s", e)
+            log.exception("Telegram thread crashed: %s", e)
 
-    th = Thread(target=_target, name="telegram-thread", daemon=True)
+    th = threading.Thread(target=_target, name="run_telegram_longpoll", daemon=True)
     th.start()
-    log.info("🧵 started telegram-thread")
+    return th
 
-# ---------------------- Entry point ----------------------
+# =========================
+# Entrypoint
+# =========================
 if __name__ == "__main__":
-    # สตาร์ท Telegram ในเธรดแยก
+    log.info("BOT_TOKEN loaded (length=%d)", len(BOT_TOKEN))
     start_telegram_thread()
 
-    # แล้วค่อยเปิด Flask (เธรดหลัก)
-    log.info("🌐 Starting Flask on 0.0.0.0:%s", PORT)
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    log.info("Starting Flask on 0.0.0.0:%s", PORT)
+    # ใช้ Flask dev server สำหรับ Render ฟรีไทร์ได้
+    flask_app.run(host="0.0.0.0", port=PORT, debug=False)
