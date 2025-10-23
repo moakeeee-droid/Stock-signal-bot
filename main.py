@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 Stock Signal Bot (Render + Telegram long-polling)
-- สำหรับ PTB 21.x (ไม่ใช้ thread แยกแล้ว)
-- รัน Flask และ Telegram ใน asyncio เดียวกัน
+- ใช้ได้กับ PTB 21.x
+- แยก Telegram ออกจาก Flask อย่างปลอดภัย
 """
 
 import os
 import logging
-import asyncio
-from datetime import datetime
+import threading
 import inspect
+from datetime import datetime
 from flask import Flask, jsonify
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
@@ -73,35 +73,22 @@ def build_telegram():
     app_tg.add_handler(CommandHandler("picks", cmd_picks))
     return app_tg
 
-async def run_telegram():
+def run_telegram():
+    import asyncio
     app_tg = build_telegram()
     log.info("🚀 Starting telegram long-polling…")
 
     sig = inspect.signature(app_tg.run_polling).parameters
     kwargs = {}
     if "close_loop" in sig:
-        kwargs["close_loop"] = False
+        kwargs["close_loop"] = True
     if "handle_signals" in sig:
         kwargs["handle_signals"] = False
 
-    await app_tg.run_polling(**kwargs)
+    asyncio.run(app_tg.run_polling(**kwargs))
 
-# =============== RUN BOTH IN ONE LOOP ===============
-async def main():
-    loop = asyncio.get_running_loop()
-
-    # รัน Flask server ใน background task
-    from hypercorn.asyncio import serve
-    from hypercorn.config import Config
-
-    config = Config()
-    config.bind = [f"0.0.0.0:{PORT}"]
-
-    flask_task = asyncio.create_task(serve(flask_app, config))
-    tg_task = asyncio.create_task(run_telegram())
-
-    await asyncio.gather(flask_task, tg_task)
-
+# =============== ENTRYPOINT ===============
 if __name__ == "__main__":
-    log.info("Starting combined Flask + Telegram app…")
-    asyncio.run(main())
+    log.info("Starting Flask + Telegram bot")
+    threading.Thread(target=run_telegram, daemon=True).start()
+    flask_app.run(host="0.0.0.0", port=PORT)
