@@ -500,10 +500,11 @@ def run_telegram_in_thread():
         try:
             # Manually start polling with Application.start + Application.updater
             # PTB v21: use application.updater.start_polling() — handled inside run_polling normally.
-            await application.updater.start_polling(
-                poll_interval=1.5, allowed_updates=Update.ALL_TYPES
+            await application.run_polling(
+    poll_interval=1.5,
+    allowed_updates=Update.ALL_TYPES,
+    stop_signals=(),
             )
-            await application.updater.wait()  # idle
         finally:
             await application.stop()
             await application.shutdown()
