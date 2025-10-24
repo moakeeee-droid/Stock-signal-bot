@@ -116,7 +116,7 @@ async def get_quote(symbols: List[str]) -> Dict[str, Dict[str, Any]]:
 
 
 # ===============================
-# CONSERVATIVE STRATEGY
+# STRATEGY
 # ===============================
 def judge_signal(closes: List[float]) -> Dict[str, Any]:
     ema20 = ema(closes, 20)
@@ -209,8 +209,17 @@ async def health(request):
 
 
 # ===============================
-# MAIN (safe loop version)
+# SAFE ENTRY POINT FOR RENDER
 # ===============================
+def run_safe_async(main_coro):
+    """ ใช้แทน asyncio.run() เพื่อกัน loop ซ้อนใน Render """
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(main_coro())
+    except RuntimeError:
+        asyncio.run(main_coro())
+
+
 async def main():
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("start", cmd_start))
@@ -218,25 +227,23 @@ async def main():
 
     webhook_url = f"{PUBLIC_URL}{WEBHOOK_PATH}"
 
-    # Telegram bot task
-    bot_task = application.run_webhook(
+    app = web.Application()
+    app.router.add_get("/", health)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+
+    log.info(f"✅ Service live at {PUBLIC_URL} | port={PORT}")
+
+    await application.run_webhook(
         listen="0.0.0.0",
         port=PORT,
         webhook_url=webhook_url,
         drop_pending_updates=True,
     )
 
-    # Healthcheck task
-    app = web.Application()
-    app.router.add_get("/", health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    web_task = site.start()
-
-    log.info(f"✅ Service live at {PUBLIC_URL} on port {PORT}")
-    await asyncio.gather(bot_task, web_task)
-
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    run_safe_async(main)
