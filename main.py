@@ -209,41 +209,40 @@ async def health(request):
 
 
 # ===============================
-# SAFE ENTRY POINT FOR RENDER
+# MAIN
 # ===============================
-def run_safe_async(main_coro):
-    """ ใช้แทน asyncio.run() เพื่อกัน loop ซ้อนใน Render """
-    try:
-        loop = asyncio.get_running_loop()
-        loop.create_task(main_coro())
-    except RuntimeError:
-        asyncio.run(main_coro())
-
-
-async def main():
-    application = Application.builder().token(BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", cmd_start))
-    application.add_handler(CommandHandler("signals", cmd_signals))
-
-    webhook_url = f"{PUBLIC_URL}{WEBHOOK_PATH}"
-
+async def start_services():
+    """Run webhook + aiohttp healthcheck"""
     app = web.Application()
     app.router.add_get("/", health)
-
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
 
-    log.info(f"✅ Service live at {PUBLIC_URL} | port={PORT}")
+    application = Application.builder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("signals", cmd_signals))
 
+    webhook_url = f"{PUBLIC_URL}{WEBHOOK_PATH}"
     await application.run_webhook(
         listen="0.0.0.0",
         port=PORT,
         webhook_url=webhook_url,
         drop_pending_updates=True,
+        close_loop=False,  # ✅ ห้ามปิด loop
     )
 
 
+def main():
+    try:
+        asyncio.get_event_loop().run_until_complete(start_services())
+    except RuntimeError:
+        # ถ้า loop ถูกเปิดอยู่แล้ว ให้ใช้ run_until_complete บน loop เดิม
+        loop = asyncio.get_event_loop()
+        loop.create_task(start_services())
+        loop.run_forever()
+
+
 if __name__ == "__main__":
-    run_safe_async(main)
+    main()
