@@ -1,29 +1,13 @@
+# main.py
 # -*- coding: utf-8 -*-
-"""
-Stock-signal-bot (Render · Web Service)
-Mode: Polling + aiohttp health server (same asyncio loop)
-
-- ใช้ PTB v21.x (Application.run_polling)
-- ไม่มีการปิด loop เอง, ไม่ใช้ updater.wait()/idle()
-- เปิด HTTP health server บนพอร์ต PORT สำหรับ Render
-
-Env ที่ต้องมี:
-  - BOT_TOKEN         : Telegram bot token
-  - PORT              : พอร์ตที่ Render โยนมา (เช่น 10000)
-OPTIONAL:
-  - PUBLIC_URL        : สำหรับ log แสดงผล (ไม่ใช้ webhook)
-"""
 
 import os
 import asyncio
 import logging
-from datetime import datetime, timezone, timedelta
-from typing import List, Tuple
+import signal
+from datetime import datetime, timezone
 
-import anyio
-import requests
 from aiohttp import web
-
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -31,158 +15,173 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# -----------------------------------------------------------------------------
+# =========================
 # Logging
-# -----------------------------------------------------------------------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+# =========================
 logging.basicConfig(
-    format="%(asctime)s | %(levelname)8s | %(name)s | %(message)s",
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 log = logging.getLogger("stock-signal-bot")
 
-# -----------------------------------------------------------------------------
-# Config
-# -----------------------------------------------------------------------------
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-if not BOT_TOKEN:
-    raise RuntimeError("ENV BOT_TOKEN is required.")
 
-PORT = int(os.environ.get("PORT", "10000"))
-PUBLIC_URL = os.environ.get("PUBLIC_URL", "").strip()
-
-# -----------------------------------------------------------------------------
-# Toy data / helpers (ตัวอย่าง mock ให้บอทตอบได้ทันที)
-# คุณจะต่อข้อมูลจริงจาก Yahoo/Finnhub ภายหลังได้เลย — ส่วน handler ไม่ต้องแก้
-# -----------------------------------------------------------------------------
-def mock_today_outlook() -> str:
-    return "โมเมนตัมกลางๆ"
-
-def mock_signals_summary() -> Tuple[int, int]:
-    # (strong_call, strong_put)
-    return (15, 22)
-
-def mock_top_picks() -> List[str]:
-    return ["BYND", "KUKE", "GSIT"]
-
-def mock_pick_detail(symbol: str) -> str:
-    # แก้ทีหลังให้ดึงจาก Yahoo/Finnhub ได้
-    # ตอบโครงสร้างให้เหมือนเวอร์ชันก่อนๆ
-    return (
-        f"• {symbol}\n"
-        f"  ├─ แนวโน้ม: Neutral/Up\n"
-        f"  ├─ %เปลี่ยนวันนี้: +1.2%\n"
-        f"  ├─ ปริมาณ: สูงกว่าค่าเฉลี่ย\n"
-        f"  └─ ความเห็น: รอจังหวะย่อสะสม"
-    )
-
-def mock_movers() -> List[str]:
-    return ["NVDA +4.3%", "AMD +3.1%", "TSLA -2.2%"]
-
-# -----------------------------------------------------------------------------
+# =========================
 # Telegram command handlers
-# -----------------------------------------------------------------------------
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (
-        "👋 ยินดีต้อนรับสู่ Stock Signal Bot\n"
+# =========================
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (
+        "👋 ยินดีต้อนรับสู่ Stock Signal Bot (โหมดฟรี)\n\n"
         "คำสั่งที่ใช้ได้:\n"
-        "/ping – ทดสอบบอท\n"
-        "/signals – สรุปสัญญาณ\n"
-        "/outlook – มุมมองตลาดวันนี้\n"
-        "/picks – หุ้นแนะนำ (ตัวอย่าง)\n"
-        "/movers – หุ้นเคลื่อนไหวเด่น\n"
+        "/ping - ทดสอบบอท\n"
+        "/signals - สัญญาณจำลอง (วันนี้)\n"
+        "/outlook - มุมมองตลาดวันนี้\n"
+        "/picks - หุ้นน่าสนใจ (ตัวอย่าง)\n"
+        "/movers - หุ้นเด่นเคลื่อนไหวมาก (ตัวอย่าง)\n"
     )
-    await update.message.reply_text(txt)
+    await update.message.reply_text(text)
 
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("pong 🏓")
 
-async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    strong_call, strong_put = mock_signals_summary()
-    txt = f"🔮 Signals (จำลอง)\nStrong CALL: {strong_call} | Strong PUT: {strong_put}"
-    await update.message.reply_text(txt)
 
-async def cmd_outlook(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    outlook = mock_today_outlook()
-    await update.message.reply_text(f"📈 Outlook วันนี้: {outlook}")
+async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # ตัวอย่างสรุปสัญญาณจำลอง
+    # (ในโปรดักชันคุณสามารถดึงข้อมูลจริงมาใส่แทนได้)
+    strong_call = 15
+    strong_put = 22
+    msg = f"🔮 Signals (จำลอง)\nStrong CALL: {strong_call} | Strong PUT: {strong_put}"
+    await update.message.reply_text(msg)
 
-async def cmd_picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    picks = mock_top_picks()
-    await update.message.reply_text("⌛ กำลังดึงข้อมูลหุ้น…")
-    # รายละเอียดแบบก่อนหน้า
-    lines = ["🧾 Picks (รายละเอียด)"]
-    for s in picks:
-        detail = mock_pick_detail(s)
-        lines.append(detail)
-    await update.message.reply_text("\n\n".join(lines))
 
-async def cmd_movers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    movers = mock_movers()
-    txt = "🚀 Movers วันนี้\n" + "\n".join(f"• {m}" for m in movers)
-    await update.message.reply_text(txt)
+async def cmd_outlook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # ตัวอย่างข้อความ outlook
+    await update.message.reply_text("📈 Outlook วันนี้: โมเมนตัมกลางๆ")
 
-# -----------------------------------------------------------------------------
-# Build Application
-# -----------------------------------------------------------------------------
-def build_application() -> Application:
-    app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("ping",    cmd_ping))
-    app.add_handler(CommandHandler("signals", cmd_signals))
-    app.add_handler(CommandHandler("outlook", cmd_outlook))
-    app.add_handler(CommandHandler("picks",   cmd_picks))
-    app.add_handler(CommandHandler("movers",  cmd_movers))
+async def _format_pick_detail(symbol: str) -> str:
+    # ที่นี่เป็น placeholder; ถ้าต้องการเชื่อม Yahoo/Finhub จริงค่อยเติมภายหลัง
+    # คืนข้อความว่าข้อมูลยังไม่พร้อม
+    return f"⚠️ {symbol}: ข้อมูลไม่พร้อม"
 
+
+async def cmd_picks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # ตัวอย่างรายชื่อ
+    picks = ["BYND", "KUKE", "GSIT"]
+    await update.message.reply_text("⏳ กำลังดึงข้อมูลหุ้น...")
+
+    details = [await _format_pick_detail(s) for s in picks]
+    header = "🧾 Picks (รายละเอียด)\n"
+    await update.message.reply_text(header + "\n".join(details))
+
+
+async def cmd_movers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # ตัวอย่าง (placeholder)
+    await update.message.reply_text("📊 Movers: (ตัวอย่าง) AAPL, NVDA, TSLA")
+
+
+# =========================
+# aiohttp healthcheck server
+# =========================
+async def handle_root(request: web.Request) -> web.Response:
+    now = datetime.now(timezone.utc).isoformat()
+    return web.Response(text=f"✅ Bot is running — {now}\n", content_type="text/plain")
+
+
+def build_web_app() -> web.Application:
+    app = web.Application()
+    app.router.add_get("/", handle_root)
+    app.router.add_get("/health", handle_root)
     return app
 
-# -----------------------------------------------------------------------------
-# HTTP health server (aiohttp)
-# -----------------------------------------------------------------------------
-async def health(request: web.Request):
-    now = datetime.now(timezone.utc).isoformat()
-    return web.Response(text=f"✅ Bot is running — {now}", content_type="text/plain")
 
-async def build_http_server() -> web.AppRunner:
-    app = web.Application()
-    app.add_routes([web.get("/", health), web.get("/healthz", health)])
-    runner = web.AppRunner(app)
+# =========================
+# Telegram bot lifecycle (Polling แบบ async)
+# =========================
+async def bot_run(application: Application, stop_event: asyncio.Event) -> None:
+    """
+    รันบอทด้วยลำดับ initialize -> start -> updater.start_polling()
+    โดยไม่เรียก run_polling() เพื่อหลีกเลี่ยงการปิด/เปิด event loop ซ้ำ
+    """
+    log.info("Starting Telegram bot (polling mode)")
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(drop_pending_updates=True)
+
+    # รอจนกว่าได้รับสัญญาณหยุด
+    await stop_event.wait()
+
+    log.info("Stopping Telegram bot...")
+    await application.updater.stop()
+    await application.stop()
+    await application.shutdown()
+    log.info("Telegram bot stopped")
+
+
+# =========================
+# Main entry
+# =========================
+async def main_async():
+    bot_token = os.environ.get("BOT_TOKEN")
+    if not bot_token:
+        raise RuntimeError("Environment variable BOT_TOKEN is required")
+
+    port = int(os.environ.get("PORT", "10000"))
+    log.info("Config | PORT=%s", port)
+
+    # สร้าง Telegram Application และผูก handler
+    application = Application.builder().token(bot_token).build()
+    application.add_handler(CommandHandler("start", cmd_start))
+    application.add_handler(CommandHandler("ping", cmd_ping))
+    application.add_handler(CommandHandler("signals", cmd_signals))
+    application.add_handler(CommandHandler("outlook", cmd_outlook))
+    application.add_handler(CommandHandler("picks", cmd_picks))
+    application.add_handler(CommandHandler("movers", cmd_movers))
+
+    # stop_event ใช้ประสานหยุดทั้ง web และ bot อย่างเรียบร้อย
+    stop_event = asyncio.Event()
+
+    # สร้าง aiohttp app สำหรับ healthcheck และเปิดพอร์ตให้ Render เห็น
+    web_app = build_web_app()
+    runner = web.AppRunner(web_app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    site = web.TCPSite(runner, host="0.0.0.0", port=port)
     await site.start()
-    log.info("HTTP health server started on port %s", PORT)
-    return runner
+    log.info("HTTP server started on 0.0.0.0:%d", port)
 
-# -----------------------------------------------------------------------------
-# Main orchestration
-# -----------------------------------------------------------------------------
-async def main():
-    log.info("Starting Stock-signal-bot in POLLING mode")
-    if PUBLIC_URL:
-        log.info("PUBLIC_URL=%s (info only; webhook not used)", PUBLIC_URL)
+    # จัดการสัญญาณ OS (SIGINT/SIGTERM) ให้หยุดงานสวย ๆ
+    loop = asyncio.get_running_loop()
 
-    # 1) start HTTP health server (non-blocking)
-    runner = await build_http_server()
+    def _graceful_stop():
+        if not stop_event.is_set():
+            log.info("Shutdown signal received")
+            stop_event.set()
 
-    # 2) start Telegram bot (blocking until cancelled)
-    application = build_application()
-    # IMPORTANT: stop_signals=() เพื่อไม่ให้ PTB จัดการสัญญาณเองบน Render
-    await application.run_polling(
-        poll_interval=1.5,
-        allowed_updates=Update.ALL_TYPES,
-        stop_signals=(),
-        close_loop=False,  # อย่าปิด loop (เราอาจมี task อื่น)
-    )
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, _graceful_stop)
+        except NotImplementedError:
+            # บางแพลตฟอร์ม (เช่น Windows) อาจไม่รองรับ
+            pass
 
-    # ถ้าหลุดจาก run_polling (เช่น ถูกสั่งปิด) -> ปิด HTTP server ให้เรียบร้อย
-    log.info("Application stopped; shutting down HTTP server")
-    await runner.cleanup()
+    # รัน Telegram bot เป็นงานคู่ขนาน
+    bot_task = asyncio.create_task(bot_run(application, stop_event), name="tg-bot")
 
-# -----------------------------------------------------------------------------
-# Entrypoint
-# -----------------------------------------------------------------------------
-if __name__ == "__main__":
+    # รอจนกว่าจะถูกสั่งหยุด
     try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log.info("Interrupted, bye.")
+        await bot_task
+    finally:
+        # ปิดเว็บเซิร์ฟเวอร์
+        await runner.cleanup()
+        log.info("HTTP server stopped")
+
+    log.info("Application terminated")
+
+
+def main():
+    # ใช้ asyncio.run เป็น entrypoint เดียว คุม event loop ทั้งหมด
+    asyncio.run(main_async())
+
+
+if __name__ == "__main__":
+    main()
