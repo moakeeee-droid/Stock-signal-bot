@@ -1,4 +1,6 @@
-python-telegram-bot>=21.1.1,<22.0
+python-telegram-bot[webhooks]>=21.1,<22.0
+requests==2.32.3
 aiohttp==3.9.5
 anyio==4.4.0
-requests==2.32.3
+yarl==1.9.4
+multidict==6.0.5
