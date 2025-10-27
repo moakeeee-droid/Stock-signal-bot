@@ -1,450 +1,424 @@
+# main.py
 # -*- coding: utf-8 -*-
-"""
-Stock-signal-bot — Render-friendly / Polling + aiohttp health
-Mode: Swing (2–5 วัน) พร้อม TP/SL อัตโนมัติ
-
-Env ต้องมี:
-  BOT_TOKEN       : โทเคน Telegram Bot
-  PORT            : พอร์ตจาก Render (เช่น 10000)
-แนะนำ:
-  DATA_SOURCE     : 'yahoo' (ค่าเริ่มต้น) หรือ 'demo'
-  TZ              : 'Asia/Bangkok'
-  LOG_LEVEL       : 'INFO' (default), 'DEBUG'
-"""
-
-from __future__ import annotations
 
 import os
-import re
-import math
 import asyncio
 import logging
 import signal
-from typing import Any, Dict, List, Optional, Tuple
-from datetime import datetime, timezone
+import time
+from datetime import datetime, timezone, timedelta
+from typing import Dict, List, Tuple, Optional
 
-import aiohttp
+import requests
 from aiohttp import web
 from telegram import Update
-from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # =========================
-# Config / Logging
+# Logging
 # =========================
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
-    level=getattr(logging, LOG_LEVEL, logging.INFO),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+    level=os.getenv("LOG_LEVEL", "INFO"),
 )
 log = logging.getLogger("stock-signal-bot")
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+# =========================
+# ENV
+# =========================
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 if not BOT_TOKEN:
-    raise RuntimeError("ENV BOT_TOKEN is required")
+    raise RuntimeError("❌ BOT_TOKEN is not set")
 
-PORT = int(os.getenv("PORT", "10000"))
-DATA_SOURCE = os.getenv("DATA_SOURCE", "yahoo").lower()  # yahoo | demo
-TZ_NAME = os.getenv("TZ", "Asia/Bangkok")
+PORT = int(os.environ.get("PORT", "10000"))
 
-# ค่ามาตรฐานสำหรับคำสั่งตัวอย่าง
-DEFAULT_PICKS = ["BYND", "KUKE", "GSIT"]
-DEFAULT_MOVERS = ["AAPL", "NVDA", "TSLA"]
+# รายชื่อหุ้นเริ่มต้น (แก้ไขได้ หรือผ่าน ENV: PICKS=BYND,KUKE,GSIT)
+DEFAULT_PICKS = os.environ.get("PICKS", "BYND,KUKE,GSIT").split(",")
+DEFAULT_PICKS = [s.strip().upper() for s in DEFAULT_PICKS if s.strip()]
 
-# =========================
-# Yahoo Clients (no API key)
-# =========================
-YF_QUOTE_URL = "https://query1.finance.yahoo.com/v7/finance/quote"
-YF_CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
-YF_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
-    ),
-    "Accept": "application/json, text/plain, */*",
-    "Connection": "keep-alive",
-}
-
-async def fetch_yahoo_quotes(symbols: List[str], timeout: float = 10.0, retries: int = 2) -> Dict[str, Dict[str, Any]]:
-    params = {"symbols": ",".join(s.upper() for s in symbols)}
-    for attempt in range(retries + 1):
-        try:
-            async with aiohttp.ClientSession(headers=YF_HEADERS) as session:
-                async with session.get(YF_QUOTE_URL, params=params, timeout=timeout) as r:
-                    if r.status != 200:
-                        raise RuntimeError(f"Yahoo quote HTTP {r.status}")
-                    js = await r.json()
-                    out: Dict[str, Dict[str, Any]] = {}
-                    for q in js.get("quoteResponse", {}).get("result", []):
-                        s = (q.get("symbol") or "").upper()
-                        if not s:
-                            continue
-                        out[s] = {
-                            "symbol": s,
-                            "name": q.get("shortName") or q.get("longName") or s,
-                            "price": q.get("regularMarketPrice"),
-                            "change": q.get("regularMarketChange"),
-                            "changePct": q.get("regularMarketChangePercent"),
-                            "prevClose": q.get("regularMarketPreviousClose"),
-                            "currency": q.get("currency") or "",
-                            "marketState": q.get("marketState") or "",
-                        }
-                    return out
-        except Exception as e:
-            log.warning("fetch_yahoo_quotes attempt %s: %s", attempt+1, e)
-            if attempt >= retries:
-                return {}
-            await asyncio.sleep(1.2 * (attempt + 1))
-    return {}
-
-async def fetch_yahoo_candles(symbol: str, period: str = "6mo", interval: str = "1d",
-                              timeout: float = 12.0, retries: int = 2) -> Dict[str, List[float]]:
-    params = {"range": period, "interval": interval, "includePrePost": "false"}
-    for attempt in range(retries + 1):
-        try:
-            async with aiohttp.ClientSession(headers=YF_HEADERS) as session:
-                async with session.get(YF_CHART_URL.format(symbol=symbol), params=params, timeout=timeout) as r:
-                    if r.status != 200:
-                        raise RuntimeError(f"Yahoo chart HTTP {r.status}")
-                    js = await r.json()
-                    result = js.get("chart", {}).get("result", [])
-                    if not result:
-                        return {"close": [], "volume": []}
-                    q = result[0]["indicators"]["quote"][0]
-                    ts = result[0].get("timestamp", [])
-                    closes = q.get("close", [])
-                    vols = q.get("volume", [])
-                    # clean None by dropping
-                    rows = [(t, c, v) for t, c, v in zip(ts, closes, vols) if c is not None]
-                    closes = [float(c) for _, c, _ in rows]
-                    vols = [int(v or 0) for _, _, v in rows]
-                    return {"close": closes, "volume": vols}
-        except Exception as e:
-            log.warning("fetch_yahoo_candles %s attempt %s: %s", symbol, attempt+1, e)
-            if attempt >= retries:
-                return {"close": [], "volume": []}
-            await asyncio.sleep(1.2 * (attempt + 1))
-    return {"close": [], "volume": []}
+# กลุ่มหุ้นสำหรับสแกนภาพรวม/สัญญาณ (แก้ไขได้ หรือใช้ ENV: UNIVERSE=...)
+DEFAULT_UNIVERSE = os.environ.get(
+    "UNIVERSE",
+    "AAPL,MSFT,GOOGL,AMZN,TSLA,NVDA,META,SPY,QQQ,IWM,AMD,INTC,NFLX,BA,XOM,JPM,SCHW,ORCL,CRM,ADBE"
+).split(",")
+DEFAULT_UNIVERSE = [s.strip().upper() for s in DEFAULT_UNIVERSE if s.strip()]
 
 # =========================
-# TA (EMA / RSI / MACD) – pure python
+# Yahoo helpers (no API key)
 # =========================
-def ema(seq: List[float], period: int) -> List[float]:
-    if not seq:
-        return []
-    k = 2 / (period + 1)
-    out: List[float] = []
-    ema_prev = None
-    for v in seq:
-        if ema_prev is None:
-            ema_prev = v
-        else:
-            ema_prev = v * k + ema_prev * (1 - k)
-        out.append(ema_prev)
+Y_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/{sym}?range={rng}&interval={ival}"
+Y_QUOTE = "https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbols}"
+
+def http_get_json(url: str, timeout=10) -> Optional[dict]:
+    try:
+        resp = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=timeout)
+        if resp.status_code == 200:
+            return resp.json()
+        log.warning("HTTP %s -> %s", resp.status_code, url)
+    except Exception as e:
+        log.warning("GET failed: %s | %s", e, url)
+    return None
+
+def fetch_quote_batch(symbols: List[str]) -> Dict[str, dict]:
+    """ดึงข้อมูล quote หลายตัวทีเดียว"""
+    if not symbols:
+        return {}
+    url = Y_QUOTE.format(symbols=",".join(symbols))
+    data = http_get_json(url)
+    out = {}
+    try:
+        for row in data["quoteResponse"]["result"]:
+            sym = row.get("symbol", "").upper()
+            out[sym] = row
+    except Exception:
+        pass
     return out
 
-def rsi(seq: List[float], period: int = 14) -> List[float]:
-    if len(seq) < period + 1:
-        return [50.0] * len(seq)
-    gains, losses = [], []
-    for i in range(1, len(seq)):
-        ch = seq[i] - seq[i - 1]
-        gains.append(max(0.0, ch))
-        losses.append(max(0.0, -ch))
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    rsis = [50.0] * period
-    r = 100.0 if avg_loss == 0 else 100 - (100/(1+avg_gain/avg_loss))
-    rsis.append(r)
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-        r = 100.0 if avg_loss == 0 else 100 - (100/(1+avg_gain/avg_loss))
-        rsis.append(r)
-    return rsis if len(rsis) == len(seq) else ([50.0]*(len(seq)-len(rsis)) + rsis)
-
-def macd(seq: List[float]) -> Dict[str, List[float]]:
-    ema12 = ema(seq, 12)
-    ema26 = ema(seq, 26)
-    macd_line = [a-b for a,b in zip(ema12, ema26)]
-    signal = ema(macd_line, 9)
-    hist = [m - s for m, s in zip(macd_line, signal)]
-    return {"macd": macd_line, "signal": signal, "hist": hist}
+def fetch_chart(sym: str, rng="6mo", ival="1d") -> Tuple[List[int], List[float]]:
+    """ดึงแท่งราคา (timestamp, close)"""
+    url = Y_CHART.format(sym=sym, rng=rng, ival=ival)
+    data = http_get_json(url)
+    try:
+        c = data["chart"]["result"][0]
+        ts = c["timestamp"]
+        cl = c["indicators"]["quote"][0]["close"]
+        # กรอง None
+        pairs = [(t, v) for t, v in zip(ts, cl) if v is not None]
+        if not pairs:
+            return [], []
+        tss, cls = zip(*pairs)
+        return list(tss), list(cls)
+    except Exception:
+        return [], []
 
 # =========================
-# Swing mode scoring & plan
+# Indicators (pure python)
 # =========================
-def swing_score_and_bias(closes: List[float]) -> Dict[str, Any]:
-    """
-    คืนค่า:
-      - price, ema20, ema50, ema200, rsi14, macd, signal, hist, hist_slope
-      - trend: Uptrend/Downtrend/Sideways
-      - bias: CALL/PUT/NEUTRAL
-      - score: int
-    """
-    if len(closes) < 60:
-        # ข้อมูลน้อย -> กลาง ๆ
-        p = closes[-1] if closes else float("nan")
-        return {"price": p, "ema20": p, "ema50": p, "ema200": p,
-                "rsi14": 50.0, "macd": 0.0, "signal": 0.0, "hist": 0.0, "hist_slope": 0.0,
-                "trend": "Sideways", "bias": "NEUTRAL", "score": 0}
+def sma(values: List[float], n: int) -> Optional[float]:
+    if len(values) < n:
+        return None
+    return sum(values[-n:]) / n
 
-    ema20v = ema(closes, 20)
-    ema50v = ema(closes, 50)
-    ema200v = ema(closes, 200)
-    rsi14v = rsi(closes, 14)
-    mac = macd(closes)
+def rsi14(values: List[float]) -> Optional[float]:
+    n = 14
+    if len(values) < n + 1:
+        return None
+    gains, losses = 0.0, 0.0
+    for i in range(-n, 0):
+        chg = values[i] - values[i - 1]
+        if chg > 0:
+            gains += chg
+        else:
+            losses -= chg
+    if gains == 0 and losses == 0:
+        return 50.0
+    rs = (gains / n) / (losses / n if losses != 0 else 1e-9)
+    return 100 - (100 / (1 + rs))
 
-    p = closes[-1]
-    e20 = ema20v[-1]; e50 = ema50v[-1]; e200 = ema200v[-1]
-    r = rsi14v[-1]
-    m = mac["macd"][-1]; s = mac["signal"][-1]; h = mac["hist"][-1]
-    h_prev = mac["hist"][-2] if len(mac["hist"]) >= 2 else h
-    h_slope = h - h_prev
-
-    trend = "Uptrend" if (p > e20 > e50 > e200) else ("Downtrend" if (p < e20 < e50 < e200) else "Sideways")
-    score = 0
-    # โหมด Swing: ให้ความสำคัญกับโครงสร้างและโมเมนตัมปานกลาง
-    if p > e50: score += 2
-    if e20 > e50: score += 2
-    if p > e20: score += 1
-    if m > s: score += 1
-    if h > 0 and h_slope > 0: score += 1
-    # RSI sweet zone สำหรับ swing (45–65)
-    if 45 <= r <= 65: score += 1
-    # Penalty ร้อน/เย็นเกินไป
-    if r >= 70: score -= 2
-    if r <= 30: score -= 2
-
-    # ตีความ bias
-    if score >= 5 and trend != "Downtrend":
-        bias = "CALL"
-    elif score <= -2 and trend != "Uptrend":
-        bias = "PUT"
-    else:
-        bias = "NEUTRAL"
-
-    return {
-        "price": p, "ema20": e20, "ema50": e50, "ema200": e200,
-        "rsi14": r, "macd": m, "signal": s, "hist": h, "hist_slope": h_slope,
-        "trend": trend, "bias": bias, "score": score
-    }
-
-def swing_plan(sig: Dict[str, Any]) -> Dict[str, str]:
-    """
-    ให้ TP/SL อัตโนมัติ (ช่วงโดยประมาณสำหรับถือ 2–5 วัน)
-    CALL:
-      - TP1 ~ +2.5% | TP2 ~ +5.0%
-      - SL  ~ -2.0% (หรือหลุด EMA20)
-    PUT:
-      - TP1 ~ +2.5% | TP2 ~ +4.5% (ทางลง)
-      - SL  ~ +2.0% (ราคาเด้งสวน)
-    NEUTRAL: รอทรงชัด
-    """
-    bias = sig["bias"]
-    if bias == "CALL":
-        return {
-            "tp1": "+2.5%", "tp2": "+5.0%",
-            "sl": "-2.0% หรือหลุด EMA20", "note": "ย่อไม่หลุด EMA20 / MACD ยังบวก"
-        }
-    if bias == "PUT":
-        return {
-            "tp1": "+2.5%", "tp2": "+4.5%",
-            "sl": "+2.0% (เด้งสวนแรง)", "note": "เด้งไม่ผ่านแนวต้าน / MACD ยังลบ"
-        }
-    return {"tp1": "-", "tp2": "-", "sl": "-", "note": "รอเบรกหรือยืนยันโมเมนตัม"}
+def pct(a: float, b: float) -> Optional[float]:
+    if b == 0 or b is None:
+        return None
+    return (a - b) / b * 100.0
 
 # =========================
-# Helpers
+# Tiny cache ลด call Yahoo
 # =========================
-def utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+class TTLCache:
+    def __init__(self, ttl_sec: int = 60):
+        self.ttl = ttl_sec
+        self.store: Dict[str, Tuple[float, object]] = {}
 
-def fmt_num(x: Optional[float], digits: int = 2) -> str:
-    if x is None or (isinstance(x, float) and (math.isnan(x) or math.isinf(x))):
+    def get(self, key: str):
+        ts_val = self.store.get(key)
+        if not ts_val:
+            return None
+        ts, val = ts_val
+        if time.time() - ts > self.ttl:
+            self.store.pop(key, None)
+            return None
+        return val
+
+    def set(self, key: str, val):
+        self.store[key] = (time.time(), val)
+
+cache_quote = TTLCache(ttl_sec=45)   # quote สดหน่อย
+cache_chart = TTLCache(ttl_sec=300)  # กราฟ cache นานขึ้น
+
+async def get_quote(symbols: List[str]) -> Dict[str, dict]:
+    key = f"q:{','.join(symbols)}"
+    got = cache_quote.get(key)
+    if got is not None:
+        return got
+    data = fetch_quote_batch(symbols)
+    cache_quote.set(key, data)
+    return data
+
+async def get_chart(sym: str) -> Tuple[List[int], List[float]]:
+    key = f"c:{sym}:6mo:1d"
+    got = cache_chart.get(key)
+    if got is not None:
+        return got
+    data = fetch_chart(sym, "6mo", "1d")
+    cache_chart.set(key, data)
+    return data
+
+# =========================
+# Healthcheck (aiohttp)
+# =========================
+async def health(request: web.Request) -> web.Response:
+    now = datetime.now(timezone.utc).isoformat()
+    return web.Response(text=f"✅ Bot is running — {now}", content_type="text/plain")
+
+async def run_http_server(stop_event: asyncio.Event) -> None:
+    app = web.Application()
+    app.router.add_get("/", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    log.info("HTTP healthcheck started on :%s", PORT)
+    await stop_event.wait()
+    log.info("HTTP server stopping...")
+    await runner.cleanup()
+
+# =========================
+# Format helpers
+# =========================
+def fmt_num(x: Optional[float], digits=2, suffix="") -> str:
+    if x is None:
         return "—"
-    fmt = f"{{:.{digits}f}}"
-    return fmt.format(x)
+    try:
+        return f"{x:.{digits}f}{suffix}"
+    except Exception:
+        return "—"
 
 def fmt_pct(x: Optional[float]) -> str:
     if x is None:
         return "—"
-    return f"{x:+.2f}%"
+    sign = "+" if x >= 0 else ""
+    return f"{sign}{x:.2f}%"
+
+def market_cap_str(v: Optional[float]) -> str:
+    if v is None:
+        return "—"
+    units = [("T", 1e12), ("B", 1e9), ("M", 1e6)]
+    for s, k in units:
+        if v >= k:
+            return f"{v / k:.2f}{s}"
+    return f"{v:.0f}"
 
 # =========================
-# Command Handlers
+# Telegram Handlers
 # =========================
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = (
-        "👋 ยินดีต้อนรับสู่ Stock Signal Bot — Swing Mode (2–5 วัน)\n\n"
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (
+        "👋 ยินดีต้อนรับสู่ Stock Signal Bot (ฟรี/ทดลอง)\n\n"
         "คำสั่งที่ใช้ได้:\n"
-        "/ping — ทดสอบบอท\n"
-        "/signals [TICKERS] — สัญญาณ Swing พร้อม TP/SL (เช่น /signals TSLA NVDA AAPL)\n"
-        "/outlook — มุมมองตลาด (สรุป)\n"
-        "/picks — หุ้นตัวอย่าง\n"
-        "/movers — หุ้นเด่นเคลื่อนไหวมาก\n\n"
-        f"⏱️ {utc_iso()}"
+        "/ping - ทดสอบบอท\n"
+        "/signals - สัญญาณรวมจากชุดหุ้น\n"
+        "/outlook - ภาพรวมตลาด (SPY, QQQ, IWM)\n"
+        "/picks - หุ้นเด่น (พร้อมรายละเอียด)\n"
+        "/movers - หุ้นเคลื่อนไหว (ตัวอย่างจากชุดสแกน)\n"
+    )
+    await update.message.reply_text(text)
+
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("pong 🏓")
+
+async def cmd_outlook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # ใช้ ETF เป็นตัวแทนภาพรวม
+    bench = ["SPY", "QQQ", "IWM"]
+    quotes = await get_quote(bench)
+    parts = ["📈 Outlook วันนี้:"]
+    for s in bench:
+        q = quotes.get(s, {})
+        price = q.get("regularMarketPrice")
+        chg = q.get("regularMarketChangePercent")
+        parts.append(f"• {s}: {fmt_num(price)} ({fmt_pct(chg)})")
+    # โมเมนตัมแบบหยาบ ๆ จาก SMA20 เทียบราคา
+    mom = []
+    for s in bench:
+        _, closes = await get_chart(s)
+        sm20 = sma(closes, 20)
+        if closes and sm20:
+            mom.append(1 if closes[-1] > sm20 else -1)
+    if mom:
+        score = sum(mom)
+        if score >= 2:
+            mood = "ขาขึ้นอ่อน ๆ"
+        elif score <= -2:
+            mood = "ขาลงอ่อน ๆ"
+        else:
+            mood = "โมเมนตัมกลางๆ"
+        parts.append(f"สรุปโมเมนตัม: {mood}")
+    await update.message.reply_text("\n".join(parts))
+
+async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # กติกาอย่างง่าย:
+    # CALL  : ปิด > SMA50 และ RSI14 > 55
+    # PUT   : ปิด < SMA50 และ RSI14 < 45
+    # Neutral: อื่น ๆ
+    universe = DEFAULT_UNIVERSE
+    strong_call = 0
+    strong_put = 0
+    checked = 0
+
+    # ดึงทีละล็อตเพื่อลด call (quotes ใช้รวบ, chart ดึงรายตัวเพื่อทำอินดี้)
+    quotes = await get_quote(universe)
+
+    for sym in universe:
+        checked += 1
+        _, closes = await get_chart(sym)
+        if not closes:
+            continue
+        price = closes[-1]
+        sm50 = sma(closes, 50)
+        rsi = rsi14(closes)
+        if sm50 is None or rsi is None:
+            continue
+        if price > sm50 and rsi > 55:
+            strong_call += 1
+        elif price < sm50 and rsi < 45:
+            strong_put += 1
+
+    txt = (
+        "🔮 Signals (ชุดสแกน)\n"
+        f"Strong CALL: {strong_call} | Strong PUT: {strong_put}\n"
+        f"(ตรวจ {checked} ตัวจากชุดสแกน)"
     )
     await update.message.reply_text(txt)
 
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("pong 🏓")
-
-async def cmd_outlook(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # เวอร์ชันสั้น (demo): สามารถผูก breadth/advance-decline ภายหลังได้
-    await update.message.reply_text("📈 Outlook วันนี้: โมเมนตัมปานกลาง เหมาะกับ Swing ตามแนวรับ/ต้าน")
-
-async def cmd_picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("⏳ กำลังดึงข้อมูลหุ้น (Picks)...")
-    syms = DEFAULT_PICKS
-    quotes: Dict[str, Dict[str, Any]] = {}
-    if DATA_SOURCE == "yahoo":
-        quotes = await fetch_yahoo_quotes(syms)
+async def cmd_picks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    picks = DEFAULT_PICKS
+    quotes = await get_quote(picks)
     lines = ["🧾 Picks (รายละเอียด)"]
-    for s in syms:
-        q = quotes.get(s) if quotes else None
-        if not q or q.get("price") is None:
-            lines.append(f"⚠️ {s}: ข้อมูลไม่พร้อม")
-        else:
-            lines.append(f"✅ {s}: {q['name']} — {fmt_num(q['price'])} {q.get('currency','')} ({fmt_pct(q.get('changePct'))})")
-    await update.message.reply_text("\n".join(lines))
-
-async def cmd_movers(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    syms = DEFAULT_MOVERS
-    quotes: Dict[str, Dict[str, Any]] = {}
-    if DATA_SOURCE == "yahoo":
-        quotes = await fetch_yahoo_quotes(syms)
-    lines = ["🚀 Movers วันนี้"]
-    for s in syms:
-        q = quotes.get(s) if quotes else None
-        if not q or q.get("price") is None:
-            lines.append(f"• {s}: ข้อมูลไม่พร้อม")
-        else:
-            lines.append(f"• {s}: {fmt_num(q['price'])} ({fmt_pct(q.get('changePct'))})")
-    await update.message.reply_text("\n".join(lines))
-
-async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # ใช้ ticker จาก args หรือถ้าไม่ระบุ ใช้ DEFAULT_PICKS
-    tickers = [re.sub(r"[^A-Za-z0-9^.-]", "", t).upper() for t in (context.args or DEFAULT_PICKS)]
-    tickers = [t for t in tickers if t][:8]  # จำกัดไม่เกิน 8 ตัว
-    await update.message.reply_text("🔎 กำลังคำนวณสัญญาณ Swing...")
-
-    # ดึง quote ล่วงหน้า (เพื่อชื่อ/ราคา)
-    quotes: Dict[str, Dict[str, Any]] = {}
-    if DATA_SOURCE == "yahoo":
-        quotes = await fetch_yahoo_quotes(tickers)
-
-    blocks: List[str] = []
-    for t in tickers:
-        # ดึงแท่งเทียนไปคำนวณอินดิเคเตอร์
-        if DATA_SOURCE == "yahoo":
-            cd = await fetch_yahoo_candles(t, period="6mo", interval="1d")
-            closes = cd.get("close", [])
-        else:
-            # DEMO: ทำราคาจำลองง่าย ๆ
-            closes = [100 + math.sin(i/5)*2 for i in range(120)]
-
-        if not closes or len(closes) < 30:
-            blocks.append(f"❌ {t}: ข้อมูลแท่งเทียนไม่พอ")
+    for sym in picks:
+        q = quotes.get(sym)
+        if not q:
+            lines.append(f"⚠️ {sym}: ข้อมูลไม่พร้อม")
             continue
 
-        sig = swing_score_and_bias(closes)
-        plan = swing_plan(sig)
+        price = q.get("regularMarketPrice")
+        chg = q.get("regularMarketChangePercent")
+        vol = q.get("regularMarketVolume")
+        avg_vol = q.get("averageDailyVolume3Month")
+        mcap = q.get("marketCap")
+        pe = q.get("trailingPE")
 
-        q = quotes.get(t) if quotes else None
-        name = (q or {}).get("name") or t
-        price = (q or {}).get("price") or sig["price"]
-        ch_pct = (q or {}).get("changePct")
+        _, closes = await get_chart(sym)
+        if not closes:
+            lines.append(f"⚠️ {sym}: ข้อมูลไม่พร้อม")
+            continue
 
-        lines = [
-            f"📌 <b>{t}</b> — {name}",
-            f"ราคา: <b>{fmt_num(price)}</b> ({fmt_pct(ch_pct)})",
-            f"แนวโน้ม: <b>{sig['trend']}</b>  |  RSI14: <b>{fmt_num(sig['rsi14'],1)}</b>",
-            f"EMA20/50/200: <code>{fmt_num(sig['ema20'])} / {fmt_num(sig['ema50'])} / {fmt_num(sig['ema200'])}</code>",
-            f"MACD: <code>{fmt_num(sig['macd'],3)} / {fmt_num(sig['signal'],3)} | Hist {fmt_num(sig['hist'],3)} (Δ {fmt_num(sig['hist_slope'],3)})</code>",
-            f"สรุป (Swing): <b>{sig['bias']}</b>  |  คะแนน: <b>{sig['score']}</b>",
-            f"แผน: TP1 {plan['tp1']} · TP2 {plan['tp2']} · SL {plan['sl']}  — {plan['note']}",
-        ]
-        blocks.append("\n".join(lines))
+        sm20 = sma(closes, 20)
+        sm50 = sma(closes, 50)
+        rsi = rsi14(closes)
 
-    msg = "\n\n".join(blocks)
-    await update.message.reply_html(msg, disable_web_page_preview=True)
+        trend = "⬆️" if (sm20 and sm50 and sm20 > sm50) else "⬇️" if (sm20 and sm50 and sm20 < sm50) else "➡️"
+        bias = (
+            "Bullish" if (closes[-1] > (sm50 or closes[-1]) and (rsi or 50) >= 55) else
+            "Bearish" if (closes[-1] < (sm50 or closes[-1]) and (rsi or 50) <= 45) else
+            "Neutral"
+        )
+
+        lines.append(
+            f"• {sym}: {fmt_num(price)} ({fmt_pct(chg)}) {trend} {bias}\n"
+            f"   RSI14: {fmt_num(rsi)} | SMA20/50: {fmt_num(sm20)}/{fmt_num(sm50)}\n"
+            f"   Vol: {vol:,} (Avg: {avg_vol:,}) | MCap: {market_cap_str(mcap)} | PE: {fmt_num(pe,2)}"
+        )
+    await update.message.reply_text("\n".join(lines))
+
+async def cmd_movers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # ใช้ชุด DEFAULT_UNIVERSE หา top เคลื่อนไหวรายวัน (จาก close ล่าสุดเทียบก่อนหน้า)
+    lines = ["📊 Movers (จากชุดสแกน)"]
+    changes: List[Tuple[str, float]] = []
+    for sym in DEFAULT_UNIVERSE:
+        _, closes = await get_chart(sym)
+        if len(closes) >= 2:
+            chg = pct(closes[-1], closes[-2]) or 0.0
+            changes.append((sym, chg))
+    if not changes:
+        await update.message.reply_text("ยังไม่มีข้อมูลเพียงพอครับ")
+        return
+    # เลือก top gainers/losers อย่างละ 3
+    changes.sort(key=lambda x: x[1], reverse=True)
+    gainers = changes[:3]
+    losers = sorted(changes, key=lambda x: x[1])[:3]
+    lines.append("↑ Gainers: " + ", ".join(f"{s} ({fmt_pct(c)})" for s, c in gainers))
+    lines.append("↓ Losers: " + ", ".join(f"{s} ({fmt_pct(c)})" for s, c in losers))
+    await update.message.reply_text("\n".join(lines))
 
 # =========================
-# aiohttp health server
+# Application builder
 # =========================
-async def handle_root(request: web.Request) -> web.Response:
-    return web.Response(text=f"✅ Bot is running — {utc_iso()}\n", content_type="text/plain")
-
-def build_web_app() -> web.Application:
-    app = web.Application()
-    app.router.add_get("/", handle_root)
-    app.router.add_get("/health", handle_root)
+def build_application() -> Application:
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("ping", cmd_ping))
+    app.add_handler(CommandHandler("signals", cmd_signals))
+    app.add_handler(CommandHandler("outlook", cmd_outlook))
+    app.add_handler(CommandHandler("picks", cmd_picks))
+    app.add_handler(CommandHandler("movers", cmd_movers))
     return app
 
 # =========================
-# Lifecycle (Polling without run_polling)
+# Bot lifecycle (POLLING + delete_webhook)
 # =========================
 async def bot_run(application: Application, stop_event: asyncio.Event) -> None:
     log.info("Starting Telegram bot (polling mode)")
     await application.initialize()
     await application.start()
-    await application.updater.start_polling(drop_pending_updates=True)
+
+    # สำคัญ: ล้าง webhook เดิม เพื่อกัน Conflict
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        log.info("Webhook deleted.")
+    except Exception as e:
+        log.warning("delete_webhook() failed: %s", e)
+
+    await application.updater.start_polling(drop_pending_updates=True, poll_interval=1.5)
+    log.info("Polling started.")
     await stop_event.wait()
+
     log.info("Stopping Telegram bot...")
     await application.updater.stop()
     await application.stop()
     await application.shutdown()
-    log.info("Telegram bot stopped")
+    log.info("Bot stopped.")
 
 # =========================
 # Main
 # =========================
-async def main_async():
-    log.info("Config | PORT=%s | DATA_SOURCE=%s | TZ=%s", PORT, DATA_SOURCE, TZ_NAME)
-
-    # สร้าง Telegram application + handlers
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("ping",    cmd_ping))
-    app.add_handler(CommandHandler("outlook", cmd_outlook))
-    app.add_handler(CommandHandler("picks",   cmd_picks))
-    app.add_handler(CommandHandler("movers",  cmd_movers))
-    app.add_handler(CommandHandler("signals", cmd_signals))
-
-    # aiohttp health server (Render ต้องการให้เปิดพอร์ต)
-    web_app = build_web_app()
-    runner = web.AppRunner(web_app)
-    await runner.setup()
-    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
-    await site.start()
-    log.info("HTTP server started on 0.0.0.0:%d", PORT)
-
+async def main_async() -> None:
+    log.info("Booting service...")
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
-
-    def _graceful_stop():
-        if not stop_event.is_set():
-            log.info("Shutdown signal received")
-            stop_event.set()
-
-    for sig in (signal.SIGINT, signal.SIGTERM):
+    for sig in (signal.SIGTERM, signal.SIGINT):
         try:
-            loop.add_signal_handler(sig, _graceful_stop)
+            loop.add_signal_handler(sig, stop_event.set)
         except NotImplementedError:
             pass
 
-    bot_task = asyncio.create_task(bot_run(app, stop_event), name="tg-bot")
+    application = build_application()
+    http_task = asyncio.create_task(run_http_server(stop_event))
+    bot_task = asyncio.create_task(bot_run(application, stop_event))
 
     try:
-        await bot_task
+        await asyncio.gather(http_task, bot_task)
+    except asyncio.CancelledError:
+        pass
     finally:
-        await runner.cleanup()
-        log.info("HTTP server stopped")
-    log.info("Application terminated")
+        stop_event.set()
+        with contextlib.suppress(Exception):
+            await asyncio.gather(http_task, bot_task, return_exceptions=True)
+        log.info("Service shutdown complete.")
 
-def main():
-    asyncio.run(main_async())
+def main() -> None:
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        pass
 
 if __name__ == "__main__":
+    import contextlib
     main()
