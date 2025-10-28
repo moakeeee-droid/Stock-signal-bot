@@ -1,113 +1,267 @@
 # main.py
-# =============================
-# Stock Signal Bot (Yahoo data)
-# Async + PTB v21 + aiohttp webhook
-# =============================
-
 import os
 import asyncio
 import logging
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple, Optional
+from random import sample, shuffle
 
-import aiohttp
 from aiohttp import web
-
 from telegram import Update
 from telegram.ext import (
     Application,
-    ApplicationBuilder,
     CommandHandler,
     ContextTypes,
 )
 
-# -----------------------------
-# Logging
-# -----------------------------
+# =========================
+# ตั้งค่าทั่วไป
+# =========================
+BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
+MODE        = os.environ.get("MODE", "webhook").lower().strip()
+PUBLIC_URL  = os.environ.get("PUBLIC_URL", "").rstrip("/")  # ใช้ใน webhook
+PORT        = int(os.environ.get("PORT", "10000"))
+
+# พอร์ตสำหรับ healthcheck (กันชนจากพอร์ตหลัก)
+HEALTH_PORT = PORT + 1
+
 logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO"),
+    level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 log = logging.getLogger("stock-signal-bot")
 
-# -----------------------------
-# Environment
-# -----------------------------
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-MODE = os.environ.get("MODE", "webhook").lower().strip()  # webhook | polling
-PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
-WEBHOOK_PATH = os.environ.get("WEBHOOK_PATH", "/webhook")
-PORT = int(os.environ.get("PORT", "10000"))
-REQ_TIMEOUT = int(os.environ.get("TIMEOUT", "8"))
 
-DEFAULT_PICKS = [s.strip().upper() for s in os.environ.get("PICKS", "BYND,KUKE,GSIT").split(",") if s.strip()]
-DEFAULT_UNIVERSE = [
-    s.strip().upper()
-    for s in os.environ.get(
-        "UNIVERSE",
-        # ดัชนี/หุ้นตัวใหญ่ๆ + ETF ที่คนเล่นบ่อย
-        "AAPL,MSFT,NVDA,GOOGL,AMZN,META,TSLA,AMD,AVGO,CRM,ADBE,COST,LIN,"
-        "NFLX,ORCL,INTC,PEP,AMAT,TSM,TMUS,"
-        "SPY,QQQ,IWM,XLK,XLF,XLE,XLY,XLV,XLI,XLB"
-    ).split(",")
-    if s.strip()
+# =========================
+# ส่วนข้อมูลจำลอง (เดโม่)
+# =========================
+INDEX_OUTLOOK = {
+    "SPY": "— (→)",
+    "QQQ": "— (→)",
+    "IWM": "— (→)",
+}
+
+GAINERS = ["TSLA (+5.59%)", "GOOGL (+3.00%)", "INTC (+2.76%)"]
+LOSERS  = ["ORCL (-0.93%)", "XOM (-0.08%)", "IWM (+0.18%)"]
+
+UNIVERSE = [
+    "AAPL","MSFT","NVDA","TSLA","META","AMZN","GOOGL","AMD","INTC","ASML",
+    "CRM","ADBE","NFLX","MU","AVGO","COST","V","MA","PYPL","SHOP",
+    "BYND","KUKE","GSIT","PLTR","SNOW","NET","DDOG","ZS","CRWD","MDB",
 ]
 
-# -----------------------------
-# HTTP Client
-# -----------------------------
-_http_session: Optional[aiohttp.ClientSession] = None
+def pick_symbols(n=3) -> list[str]:
+    # เลือกแบบสุ่ม ถ้ากังวลซ้ำ ให้ shuffle ก่อนทุกครั้ง
+    pool = UNIVERSE[:]
+    shuffle(pool)
+    return sample(pool, k=n)
 
 
-def http_session() -> aiohttp.ClientSession:
-    global _http_session
-    if _http_session is None or _http_session.closed:
-        _http_session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=REQ_TIMEOUT),
-            headers={
-                "User-Agent": "Mozilla/5.0 (compatible; StockSignalBot/1.0; +https://t.me/)"
-            },
-        )
-    return _http_session
+# =========================
+# Handlers
+# =========================
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "สวัสดีครับ 👋\n"
+        "คำสั่งที่ใช้ได้:\n"
+        "/ping – ทดสอบบอท\n"
+        "/signals – สรุปสัญญาณรวม\n"
+        "/outlook – มุมมองตลาด\n"
+        "/movers – หุ้นเด่นขึ้น/ลง\n"
+        "/picks – หุ้นน่าสนใจ (สุ่ม)"
+    )
+
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("pong 🏓")
+
+async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # เดโม่: สุ่มจำนวน CALL/PUT
+    strong_call = 15
+    strong_put  = 1
+    total_scanned = 20
+    text = (
+        "🔮 Signals (ชุดสแกน)\n"
+        f"Strong CALL: {strong_call} | Strong PUT: {strong_put}\n"
+        f"(ตรวจจ {total_scanned} ตัวจากชุดสแกน)\n"
+    )
+    await update.message.reply_text(text)
+
+async def cmd_outlook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    txt = (
+        "📉 Outlook วันนี้:\n"
+        f"• SPY: {INDEX_OUTLOOK.get('SPY','–')}\n"
+        f"• QQQ: {INDEX_OUTLOOK.get('QQQ','–')}\n"
+        f"• IWM: {INDEX_OUTLOOK.get('IWM','–')}\n"
+        "สรุปโมเมนตัม: ขาขึ้นอ่อน ๆ"
+    )
+    await update.message.reply_text(txt)
+
+async def cmd_movers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    txt = (
+        "📊 Movers (จากชุดสแกน)\n"
+        f"↑ Gainers: {', '.join(GAINERS)}\n"
+        f"↓ Losers: {', '.join(LOSERS)}"
+    )
+    await update.message.reply_text(txt)
+
+async def cmd_picks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("⏳ กำลังดึงข้อมูลหุ้น…")
+    # เดโม่: สุ่ม 3 ตัว เพื่อไม่ให้ซ้ำเดิม
+    syms = pick_symbols(3)
+    # คุณสามารถเติม logic ไปเรียก API จริง แล้ว format รายละเอียดได้ที่นี่
+    details = [f"• {s}: ข้อมูลพร้อม ✅" for s in syms]
+    txt = "🧾 Picks (รายละเอียด)\n" + "\n".join(details)
+    await update.message.reply_text(txt)
 
 
-# -----------------------------
-# Yahoo helpers (unofficial)
-# -----------------------------
-Y_BASE = "https://query1.finance.yahoo.com"
+# =========================
+# Health server (aiohttp)
+# =========================
+async def health_handler(request: web.Request) -> web.Response:
+    return web.Response(
+        text=f"✅ Bot is running – {datetime.now(timezone.utc).isoformat()}",
+        content_type="text/plain",
+    )
 
-async def yf_quote(symbols: List[str]) -> Dict[str, dict]:
-    """Fetch quotes for symbols from Yahoo (some may fail)."""
-    out: Dict[str, dict] = {}
-    if not symbols:
-        return out
-
-    # Yahoo supports up to ~50 per request; we chunk to be safe
-    chunk = 30
-    for i in range(0, len(symbols), chunk):
-        batch = ",".join(symbols[i:i+chunk])
-        url = f"{Y_BASE}/v7/finance/quote?symbols={batch}"
-        try:
-            async with http_session().get(url) as r:
-                if r.status != 200:
-                    log.warning("quote HTTP %s on %s", r.status, batch)
-                    continue
-                data = await r.json()
-                for row in data.get("quoteResponse", {}).get("result", []):
-                    sym = row.get("symbol")
-                    if sym:
-                        out[sym.upper()] = row
-        except Exception as e:
-            log.exception("quote error: %s", e)
-    return out
+async def start_health_server() -> web.AppRunner:
+    app = web.Application()
+    app.router.add_get("/", health_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", HEALTH_PORT)
+    await site.start()
+    log.info(f"Healthcheck started on :{HEALTH_PORT}")
+    return runner
 
 
-async def yf_chart(symbol: str, rng: str = "6mo", interval: str = "1d") -> Tuple[List[int], List[float]]:
+# =========================
+# Run modes
+# =========================
+async def run_webhook(application: Application) -> None:
     """
-    Return (timestamps, close_prices). If fail -> empty.
+    รันแบบ webhook:
+    - set/delete webhook ให้เรียบร้อย
+    - เริ่ม telegram updater + health server แยกพอร์ต
+    - loop ค้างไว้เพื่อกัน Render ปิดโปรเซส
     """
-    params = f"range={rng}&interval={interval}&includePrePost=false&events=div|split&corsDomain=finance.yahoo.com"
-    url = f"{Y_BASE}/v8/finance/chart/{symbol}?{params}"
+    if not PUBLIC_URL:
+        raise RuntimeError("PUBLIC_URL is required in webhook mode.")
+
+    # ล้าง webhook เดิม + ตัดคิวเก่า
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
+
+    webhook_url = f"{PUBLIC_URL}/webhook"
+    await application.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
+    log.info(f"Webhook set: {webhook_url}")
+
+    # init / start app
+    await application.initialize()
+    await application.start()
+
+    # start telegram webhook listener (บน PORT หลัก)
+    await application.updater.start_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path="/webhook",
+        webhook_url=webhook_url,
+        drop_pending_updates=True,
+    )
+    log.info(f"Telegram webhook listener on :{PORT}")
+
+    # health server แยกพอร์ต
+    health_runner = await start_health_server()
+
+    # keep alive
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        # ปิดให้เรียบร้อย
+        await application.updater.stop()
+        await application.stop()
+        await health_runner.cleanup()
+        log.info("Webhook stopped cleanly.")
+
+async def run_polling(application: Application) -> None:
+    """
+    รันแบบ polling:
+    - delete webhook ก่อน (กัน conflict)
+    - start polling ด้วย updater
+    """
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+    except Exception:
+        pass
+
+    await application.initialize()
+    await application.start()
+
+    await application.updater.start_polling(
+        poll_interval=1.5,
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=True,
+    )
+    log.info("Polling started.")
+
+    # health server ให้ด้วย (สะดวกเช็คสถานะ)
+    health_runner = await start_health_server()
+
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        await application.updater.stop()
+        await application.stop()
+        await health_runner.cleanup()
+        log.info("Polling stopped cleanly.")
+
+
+# =========================
+# สร้างแอป + ผูกคำสั่ง
+# =========================
+def build_application() -> Application:
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN not set.")
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start",   cmd_start))
+    app.add_handler(CommandHandler("ping",    cmd_ping))
+    app.add_handler(CommandHandler("signals", cmd_signals))
+    app.add_handler(CommandHandler("outlook", cmd_outlook))
+    app.add_handler(CommandHandler("movers",  cmd_movers))
+    app.add_handler(CommandHandler("picks",   cmd_picks))
+
+    return app
+
+
+# =========================
+# Entry point
+# =========================
+async def main_async():
+    log.info(f"Starting stock-signal-bot | MODE={MODE} | PORT={PORT}")
+    application = build_application()
+
+    if MODE == "webhook":
+        await run_webhook(application)
+    else:
+        # ค่าอื่นๆ ทั้งหมด จะถือเป็น polling
+        await run_polling(application)
+
+def main():
+    try:
+        asyncio.run(main_async())
+    except KeyboardInterrupt:
+        log.info("Shutting down...")
+
+if __name__ == "__main__":
+    main()    url = f"{Y_BASE}/v8/finance/chart/{symbol}?{params}"
     try:
         async with http_session().get(url) as r:
             if r.status != 200:
