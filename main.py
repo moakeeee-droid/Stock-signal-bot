@@ -1,605 +1,339 @@
-# main.py
 import os
 import asyncio
-import logging
-from datetime import datetime, timezone
-from random import sample, shuffle
+import random
+from datetime import datetime, timezone, timedelta
+from typing import List, Dict, Any, Optional
 
-from aiohttp import web
+from aiohttp import web, ClientSession, ClientTimeout
 from telegram import Update
+from telegram.constants import ParseMode
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    ContextTypes,
+    Application, CommandHandler, ContextTypes
 )
 
-# =========================
-# ตั้งค่าทั่วไป
-# =========================
-BOT_TOKEN   = os.environ.get("BOT_TOKEN", "")
-MODE        = os.environ.get("MODE", "webhook").lower().strip()
-PUBLIC_URL  = os.environ.get("PUBLIC_URL", "").rstrip("/")  # ใช้ใน webhook
-PORT        = int(os.environ.get("PORT", "10000"))
+# =========================================================
+# Config & constants
+# =========================================================
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "")
+PORT = int(os.environ.get("PORT", "10000"))
 
-# พอร์ตสำหรับ healthcheck (กันชนจากพอร์ตหลัก)
-HEALTH_PORT = PORT + 1
+if not BOT_TOKEN:
+    raise RuntimeError("ENV BOT_TOKEN is required")
+if not POLYGON_API_KEY:
+    raise RuntimeError("ENV POLYGON_API_KEY is required")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
-log = logging.getLogger("stock-signal-bot")
+# Polygon endpoints (ใช้ Snapshot รุ่น v2 ที่เสถียร)
+POLY_BASE = "https://api.polygon.io"
+SNAP_GAINERS = f"{POLY_BASE}/v2/snapshot/locale/us/markets/stocks/gainers"
+SNAP_LOSERS = f"{POLY_BASE}/v2/snapshot/locale/us/markets/stocks/losers"
+SNAP_SINGLE = f"{POLY_BASE}/v2/snapshot/locale/us/markets/stocks/tickers"
+# Aggregates (bars)
+AGG_RANGE = f"{POLY_BASE}/v2/aggs/ticker"  # /{ticker}/range/{mult}/{timespan}/{from}/{to}
 
+# =========================================================
+# Helpers
+# =========================================================
+def fmt_pct(x: float) -> str:
+    sign = "↑" if x >= 0 else "↓"
+    return f"{sign} {abs(x):.2f}%"
 
-# =========================
-# ส่วนข้อมูลจำลอง (เดโม่)
-# =========================
-INDEX_OUTLOOK = {
-    "SPY": "— (→)",
-    "QQQ": "— (→)",
-    "IWM": "— (→)",
-}
+def chunks(lst: List[Any], n: int) -> List[List[Any]]:
+    return [lst[i:i+n] for i in range(0, len(lst), n)]
 
-GAINERS = ["TSLA (+5.59%)", "GOOGL (+3.00%)", "INTC (+2.76%)"]
-LOSERS  = ["ORCL (-0.93%)", "XOM (-0.08%)", "IWM (+0.18%)"]
-
-UNIVERSE = [
-    "AAPL","MSFT","NVDA","TSLA","META","AMZN","GOOGL","AMD","INTC","ASML",
-    "CRM","ADBE","NFLX","MU","AVGO","COST","V","MA","PYPL","SHOP",
-    "BYND","KUKE","GSIT","PLTR","SNOW","NET","DDOG","ZS","CRWD","MDB",
-]
-
-def pick_symbols(n=3) -> list[str]:
-    # เลือกแบบสุ่ม ถ้ากังวลซ้ำ ให้ shuffle ก่อนทุกครั้ง
-    pool = UNIVERSE[:]
-    shuffle(pool)
-    return sample(pool, k=n)
-
-
-# =========================
-# Handlers
-# =========================
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "สวัสดีครับ 👋\n"
-        "คำสั่งที่ใช้ได้:\n"
-        "/ping – ทดสอบบอท\n"
-        "/signals – สรุปสัญญาณรวม\n"
-        "/outlook – มุมมองตลาด\n"
-        "/movers – หุ้นเด่นขึ้น/ลง\n"
-        "/picks – หุ้นน่าสนใจ (สุ่ม)"
-    )
-
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("pong 🏓")
-
-async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # เดโม่: สุ่มจำนวน CALL/PUT
-    strong_call = 15
-    strong_put  = 1
-    total_scanned = 20
-    text = (
-        "🔮 Signals (ชุดสแกน)\n"
-        f"Strong CALL: {strong_call} | Strong PUT: {strong_put}\n"
-        f"(ตรวจจ {total_scanned} ตัวจากชุดสแกน)\n"
-    )
-    await update.message.reply_text(text)
-
-async def cmd_outlook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    txt = (
-        "📉 Outlook วันนี้:\n"
-        f"• SPY: {INDEX_OUTLOOK.get('SPY','–')}\n"
-        f"• QQQ: {INDEX_OUTLOOK.get('QQQ','–')}\n"
-        f"• IWM: {INDEX_OUTLOOK.get('IWM','–')}\n"
-        "สรุปโมเมนตัม: ขาขึ้นอ่อน ๆ"
-    )
-    await update.message.reply_text(txt)
-
-async def cmd_movers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    txt = (
-        "📊 Movers (จากชุดสแกน)\n"
-        f"↑ Gainers: {', '.join(GAINERS)}\n"
-        f"↓ Losers: {', '.join(LOSERS)}"
-    )
-    await update.message.reply_text(txt)
-
-async def cmd_picks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("⏳ กำลังดึงข้อมูลหุ้น…")
-    # เดโม่: สุ่ม 3 ตัว เพื่อไม่ให้ซ้ำเดิม
-    syms = pick_symbols(3)
-    # คุณสามารถเติม logic ไปเรียก API จริง แล้ว format รายละเอียดได้ที่นี่
-    details = [f"• {s}: ข้อมูลพร้อม ✅" for s in syms]
-    txt = "🧾 Picks (รายละเอียด)\n" + "\n".join(details)
-    await update.message.reply_text(txt)
-
-
-# =========================
-# Health server (aiohttp)
-# =========================
-async def health_handler(request: web.Request) -> web.Response:
-    return web.Response(
-        text=f"✅ Bot is running – {datetime.now(timezone.utc).isoformat()}",
-        content_type="text/plain",
-    )
-
-async def start_health_server() -> web.AppRunner:
-    app = web.Application()
-    app.router.add_get("/", health_handler)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", HEALTH_PORT)
-    await site.start()
-    log.info(f"Healthcheck started on :{HEALTH_PORT}")
-    return runner
-
-
-# =========================
-# Run modes
-# =========================
-async def run_webhook(application: Application) -> None:
-    """
-    รันแบบ webhook:
-    - set/delete webhook ให้เรียบร้อย
-    - เริ่ม telegram updater + health server แยกพอร์ต
-    - loop ค้างไว้เพื่อกัน Render ปิดโปรเซส
-    """
-    if not PUBLIC_URL:
-        raise RuntimeError("PUBLIC_URL is required in webhook mode.")
-
-    # ล้าง webhook เดิม + ตัดคิวเก่า
-    try:
-        await application.bot.delete_webhook(drop_pending_updates=True)
-    except Exception:
-        pass
-
-    webhook_url = f"{PUBLIC_URL}/webhook"
-    await application.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
-    log.info(f"Webhook set: {webhook_url}")
-
-    # init / start app
-    await application.initialize()
-    await application.start()
-
-    # start telegram webhook listener (บน PORT หลัก)
-    await application.updater.start_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path="/webhook",
-        webhook_url=webhook_url,
-        drop_pending_updates=True,
-    )
-    log.info(f"Telegram webhook listener on :{PORT}")
-
-    # health server แยกพอร์ต
-    health_runner = await start_health_server()
-
-    # keep alive
-    try:
-        while True:
-            await asyncio.sleep(3600)
-    except asyncio.CancelledError:
-        pass
-    finally:
-        # ปิดให้เรียบร้อย
-        await application.updater.stop()
-        await application.stop()
-        await health_runner.cleanup()
-        log.info("Webhook stopped cleanly.")
-
-async def run_polling(application: Application) -> None:
-    """
-    รันแบบ polling:
-    - delete webhook ก่อน (กัน conflict)
-    - start polling ด้วย updater
-    """
-    try:
-        await application.bot.delete_webhook(drop_pending_updates=True)
-    except Exception:
-        pass
-
-    await application.initialize()
-    await application.start()
-
-    await application.updater.start_polling(
-        poll_interval=1.5,
-        allowed_updates=Update.ALL_TYPES,
-        drop_pending_updates=True,
-    )
-    log.info("Polling started.")
-
-    # health server ให้ด้วย (สะดวกเช็คสถานะ)
-    health_runner = await start_health_server()
-
-    try:
-        while True:
-            await asyncio.sleep(3600)
-    except asyncio.CancelledError:
-        pass
-    finally:
-        await application.updater.stop()
-        await application.stop()
-        await health_runner.cleanup()
-        log.info("Polling stopped cleanly.")
-
-
-# =========================
-# สร้างแอป + ผูกคำสั่ง
-# =========================
-def build_application() -> Application:
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN not set.")
-
-    app = Application.builder().token(BOT_TOKEN).build()
-
-    app.add_handler(CommandHandler("start",   cmd_start))
-    app.add_handler(CommandHandler("ping",    cmd_ping))
-    app.add_handler(CommandHandler("signals", cmd_signals))
-    app.add_handler(CommandHandler("outlook", cmd_outlook))
-    app.add_handler(CommandHandler("movers",  cmd_movers))
-    app.add_handler(CommandHandler("picks",   cmd_picks))
-
-    return app
-
-
-# =========================
-# Entry point
-# =========================
-async def main_async():
-    log.info(f"Starting stock-signal-bot | MODE={MODE} | PORT={PORT}")
-    application = build_application()
-
-    if MODE == "webhook":
-        await run_webhook(application)
-    else:
-        # ค่าอื่นๆ ทั้งหมด จะถือเป็น polling
-        await run_polling(application)
-
-def main():
-    try:
-        asyncio.run(main_async())
-    except KeyboardInterrupt:
-        log.info("Shutting down...")
-
-if __name__ == "__main__":
-    main()    url = f"{Y_BASE}/v8/finance/chart/{symbol}?{params}"
-    try:
-        async with http_session().get(url) as r:
-            if r.status != 200:
-                log.warning("chart HTTP %s on %s", r.status, symbol)
-                return [], []
-            data = await r.json()
-            res = data.get("chart", {}).get("result", [])
-            if not res:
-                return [], []
-            series = res[0]
-            ts = series.get("timestamp", []) or []
-            closes = series.get("indicators", {}).get("quote", [{}])[0].get("close", []) or []
-            # filter None
-            t2, c2 = [], []
-            for t, c in zip(ts, closes):
-                if c is not None:
-                    t2.append(t)
-                    c2.append(float(c))
-            return t2, c2
-    except Exception as e:
-        log.exception("chart error %s: %s", symbol, e)
-        return [], []
-
-
-# -----------------------------
-# Indicators
-# -----------------------------
-def sma(vals: List[float], n: int) -> Optional[float]:
-    if len(vals) < n:
+# -------------------- TA (RSI/ATR mini) -------------------
+def rsi_from_closes(closes: List[float], period: int = 14) -> Optional[float]:
+    if len(closes) < period + 1:
         return None
-    return sum(vals[-n:]) / n
-
-
-def rsi14(vals: List[float]) -> Optional[float]:
-    if len(vals) < 15:
-        return None
-    gains, losses = 0.0, 0.0
-    for i in range(-14, 0):
-        chg = vals[i] - vals[i-1]
-        gains += chg if chg > 0 else 0.0
-        losses += -chg if chg < 0 else 0.0
-    if losses == 0:
+    gains = []
+    losses = []
+    for i in range(1, period + 1):
+        diff = closes[-(i+0)] - closes[-(i+1)]
+        if diff >= 0:
+            gains.append(diff)
+        else:
+            losses.append(-diff)
+    avg_gain = sum(gains) / period if gains else 0.0
+    avg_loss = sum(losses) / period if losses else 0.0
+    if avg_loss == 0:
         return 100.0
-    rs = (gains / 14.0) / (losses / 14.0)
-    return 100.0 - 100.0 / (1.0 + rs)
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
 
-
-def pct(a: float, b: float) -> Optional[float]:
-    try:
-        if b == 0:
-            return None
-        return (a - b) / b * 100.0
-    except Exception:
+def atr_from_ohlc(hlc: List[Dict[str, float]], period: int = 14) -> Optional[float]:
+    # hlc: list of {"h":, "l":, "c":}
+    if len(hlc) < period + 1:
         return None
+    trs = []
+    prev_close = hlc[-(period+1)]["c"]
+    for i in range(period):
+        bar = hlc[-(i+1)]
+        high, low, close = bar["h"], bar["l"], bar["c"]
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+        prev_close = close
+    return sum(trs) / period if trs else None
 
+# =========================================================
+# Polygon Client (aiohttp)
+# =========================================================
+class PolygonClient:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.session: Optional[ClientSession] = None
 
-# -----------------------------
-# Formatting
-# -----------------------------
-def fmt_pct(x: Optional[float], digits: int = 2) -> str:
-    if x is None:
-        return "—"
-    sign = "+" if x >= 0 else ""
-    return f"{sign}{x:.{digits}f}%"
+    async def ensure(self):
+        if self.session is None or self.session.closed:
+            self.session = ClientSession(timeout=ClientTimeout(total=20))
 
-def fmt_num(x: Optional[float], digits: int = 2) -> str:
-    if x is None:
-        return "—"
-    return f"{x:.{digits}f}"
+    async def close(self):
+        if self.session and not self.session.closed:
+            await self.session.close()
 
-def market_cap_str(x: Optional[float]) -> str:
-    if not x:
-        return "—"
-    # billions / trillions
-    n = float(x)
-    if n >= 1e12:
-        return f"{n/1e12:.2f}T"
-    if n >= 1e9:
-        return f"{n/1e9:.2f}B"
-    if n >= 1e6:
-        return f"{n/1e6:.2f}M"
-    return f"{int(n)}"
+    async def _get(self, url: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
+        await self.ensure()
+        params = params.copy() if params else {}
+        params["apiKey"] = self.api_key
+        async with self.session.get(url, params=params) as r:
+            r.raise_for_status()
+            return await r.json()
 
-# -----------------------------
-# Picks Auto (Momentum-ish)
-# -----------------------------
-async def choose_dynamic_picks(n: int = 3) -> List[str]:
-    """
-    เลือกหุ้นเด่นจาก DEFAULT_UNIVERSE ตามกติกา:
-    - มีข้อมูลอย่างน้อย 50 แท่ง
-    - ราคาล่าสุด > SMA50
-    - RSI14 > 55
-    - เรียงตาม % เปลี่ยนของวันล่าสุด (ล่าสุดเทียบวันก่อน)
-    """
-    scores: List[Tuple[str, float]] = []
-    # เพื่อความเร็ว: ขอ quote รอบเดียวเอาชื่อไว้ทำ sanity (ไม่บังคับ)
-    for sym in DEFAULT_UNIVERSE:
-        _, closes = await yf_chart(sym)
-        if len(closes) < 50:
-            continue
-        price = closes[-1]
-        sm50 = sma(closes, 50)
-        rsi = rsi14(closes)
-        if sm50 is None or rsi is None:
-            continue
-        if price > sm50 and rsi > 55:
-            dchg = pct(price, closes[-2]) if len(closes) >= 2 else 0.0
-            scores.append((sym, dchg or 0.0))
+    # -------- snapshot gainers/losers ----------
+    async def gainers(self) -> List[Dict[str, Any]]:
+        data = await self._get(SNAP_GAINERS)
+        return data.get("tickers", []) or data.get("results", []) or []
 
-    scores.sort(key=lambda x: x[1], reverse=True)
-    picks = [s for s, _ in scores[:n]]
-    log.info("AUTO PICKS -> %s", picks)
-    return picks
+    async def losers(self) -> List[Dict[str, Any]]:
+        data = await self._get(SNAP_LOSERS)
+        return data.get("tickers", []) or data.get("results", []) or []
 
+    # -------- snapshot single (last / previous / day agg quick) ----------
+    async def snapshot_many(self, tickers: List[str]) -> Dict[str, Any]:
+        # docs เดิมรองรับ comma-separated
+        params = {"tickers": ",".join(tickers)}
+        return await self._get(SNAP_SINGLE, params)
 
-# -----------------------------
-# Telegram Handlers
-# -----------------------------
-def parse_symbols_from_args(args: List[str]) -> List[str]:
-    if not args:
-        return []
-    joined = " ".join(args).replace(",", " ")
-    syms = [s.strip().upper() for s in joined.split() if s.strip()]
-    return syms[:12]
+    # -------- aggregates (daily) ----------
+    async def daily_bars(self, ticker: str, days: int = 60) -> List[Dict[str, Any]]:
+        # from ... to ... (UTC)
+        end = datetime.now(timezone.utc).date()
+        start = end - timedelta(days=days + 10)
+        url = f"{AGG_RANGE}/{ticker}/range/1/day/{start}/{end}"
+        data = await self._get(url, {"adjusted": "true", "sort": "asc", "limit": 5000})
+        results = data.get("results", []) or []
+        bars = []
+        for r in results:
+            # v2 aggs fields: o,h,l,c,v,t (ms)
+            bars.append({
+                "o": float(r["o"]),
+                "h": float(r["h"]),
+                "l": float(r["l"]),
+                "c": float(r["c"]),
+                "v": float(r.get("v", 0)),
+                "t": int(r["t"])
+            })
+        return bars
 
+# =========================================================
+# Bot logic
+# =========================================================
+poly = PolygonClient(POLYGON_API_KEY)
 
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong 🏓")
 
+async def cmd_movers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    ดึง gainers/losers แล้วสุ่มขึ้นมาชุดเล็กเพื่อสรุป
+    """
+    try:
+        gainers = await poly.gainers()
+        losers = await poly.losers()
 
-async def cmd_movers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # เอา top movers จาก universe แบบง่าย: เทียบ %day change แล้วเลือก 3 ตัวบน/ล่าง
-    universe = DEFAULT_UNIVERSE[:20]  # กันยาวเกิน
-    quotes = await yf_quote(universe)
+        # polygon snapshot schema ที่พบบ่อย: {"ticker": "TSLA", "todaysChangePerc": 5.3, ...}
+        top_g = [(x.get("ticker") or x.get("T")), float(x.get("todaysChangePerc", x.get("todays_change_percent", 0.0))) for x in gainers]
+        top_l = [(x.get("ticker") or x.get("T")), float(x.get("todaysChangePerc", x.get("todays_change_percent", 0.0))) for x in losers]
 
-    rows = []
-    for sym in universe:
-        q = quotes.get(sym)
-        if not q:
-            continue
-        rows.append(
-            (sym, q.get("regularMarketChangePercent"))
+        random.shuffle(top_g)
+        random.shuffle(top_l)
+        g_show = top_g[:3]
+        l_show = top_l[:3]
+
+        g_txt = ", ".join([f"{t} ({fmt_pct(p)})" for t, p in g_show]) if g_show else "—"
+        l_txt = ", ".join([f"{t} ({fmt_pct(p)})" for t, p in l_show]) if l_show else "—"
+
+        msg = (
+            "📊 *Movers (จากชุดสแกน)*\n"
+            f"↑ Gainers: {g_txt}\n"
+            f"↓ Losers: {l_txt}"
         )
-    rows = [(s, c if isinstance(c, (int, float)) else None) for s, c in rows]
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await update.message.reply_text(f"เกิดข้อผิดพลาดดึง movers: {e}")
 
-    # top gainers/losers
-    top = sorted([r for r in rows if r[1] is not None], key=lambda x: x[1], reverse=True)
-    gainers = top[:3]
-    losers = top[-3:][::-1] if len(top) >= 3 else []
+async def _compute_signal_for(ticker: str) -> Optional[Dict[str, Any]]:
+    """
+    คำนวณ RSI และ ATR จาก daily bars (เร็วและเบา)
+    ส่งกลับ structure สำหรับ /signals และ /picks
+    """
+    bars = await poly.daily_bars(ticker, days=120)
+    if len(bars) < 20:
+        return None
 
-    lines = ["📊 Movers (จากชุดสแกน)"]
-    if gainers:
-        gtxt = ", ".join([f"{s} ({fmt_pct(p)})" for s, p in gainers])
-        lines.append(f"↑ Gainers: {gtxt}")
-    if losers:
-        ltxt = ", ".join([f"{s} ({fmt_pct(p)})" for s, p in losers])
-        lines.append(f"↓ Losers: {ltxt}")
+    closes = [b["c"] for b in bars]
+    rsi = rsi_from_closes(closes, period=14)
+    hlc = [{"h": b["h"], "l": b["l"], "c": b["c"]} for b in bars]
+    atr = atr_from_ohlc(hlc, period=14)
 
-    await update.message.reply_text("\n".join(lines))
+    last = bars[-1]
+    prev = bars[-2]
+    chg = (last["c"] - prev["c"]) / prev["c"] * 100.0
 
+    return {
+        "ticker": ticker,
+        "close": last["c"],
+        "chg": chg,
+        "rsi": rsi,
+        "atr": atr,
+        "vol": last.get("v", 0)
+    }
 
-async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # นับสัญญาณจาก universe: CALL ถ้าปิด>50sma & RSI>55, PUT ถ้าปิด<50sma & RSI<45
-    call, put = 0, 0
-    checked = 0
-    for sym in DEFAULT_UNIVERSE[:40]:  # จำกัดเพื่อความเร็ว
-        _, closes = await yf_chart(sym)
-        if len(closes) < 50:
-            continue
-        checked += 1
-        last = closes[-1]
-        sm50 = sma(closes, 50) or last
-        rsi = rsi14(closes) or 50
-        if last > sm50 and rsi >= 55:
-            call += 1
-        elif last < sm50 and rsi <= 45:
-            put += 1
+async def _pick_universe() -> List[str]:
+    """
+    ดึง universe แบบเบา ๆ:
+    - สุ่มจาก gainers 10 และ losers 10 รวม ~20
+    เพื่อให้ผลสลับไม่จำเจ
+    """
+    g = await poly.gainers()
+    l = await poly.losers()
+    gg = [x.get("ticker") or x.get("T") for x in g]
+    ll = [x.get("ticker") or x.get("T") for x in l]
+    gg = [t for t in gg if t]  # clean
+    ll = [t for t in ll if t]
+    random.shuffle(gg)
+    random.shuffle(ll)
+    universe = (gg[:10] + ll[:10])
+    random.shuffle(universe)
+    return list(dict.fromkeys(universe))  # unique, keep order
 
-    await update.message.reply_text(
-        f"🔮 Signals (ชุดสแกน)\nStrong CALL: {call} | Strong PUT: {put}\n(ตรวจ {checked} ตัวจากชุดสแกน)"
-    )
+async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    สรุปนับจำนวน Strong CALL/PUT จาก universe
+    เกณฑ์ตัวอย่าง:
+      - Strong CALL: RSI > 60 และ +chg > 0.5%
+      - Strong PUT : RSI < 40 และ -chg < -0.5%
+    """
+    try:
+        universe = await _pick_universe()
+        results = []
+        # จำกัด concurrent เพื่อไม่ชน rate limit
+        sem = asyncio.Semaphore(6)
 
+        async def worker(sym):
+            async with sem:
+                sig = await _compute_signal_for(sym)
+                if sig:
+                    results.append(sig)
 
-async def cmd_outlook(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # สรุปตลาดด้วย ETF: SPY / QQQ / IWM
+        await asyncio.gather(*[worker(t) for t in universe])
+
+        strong_call = [r for r in results if (r["rsi"] is not None and r["rsi"] > 60 and r["chg"] > 0.5)]
+        strong_put  = [r for r in results if (r["rsi"] is not None and r["rsi"] < 40 and r["chg"] < -0.5)]
+
+        msg = (
+            "🪄 *Signals (ชุดสแกน)*\n"
+            f"Strong CALL: {len(strong_call)} | Strong PUT: {len(strong_put)}\n"
+            f"(ตรวจกับ {len(results)} ตัวจากชุดสแกน)"
+        )
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await update.message.reply_text(f"เกิดข้อผิดพลาดคำนวณ signals: {e}")
+
+async def cmd_outlook(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    มองภาพรวมง่าย ๆ จาก ETF ใหญ่ 3 ตัว (SPY/QQQ/IWM)
+    ใช้ %chg วันล่าสุด เพื่อแปลโมเมนตัม
+    """
     bench = ["SPY", "QQQ", "IWM"]
-    quotes = await yf_quote(bench)
-    lines = ["📉 Outlook วันนี้:"]
-    for sym in bench:
-        q = quotes.get(sym, {})
-        pct_day = q.get("regularMarketChangePercent")
-        arrow = "↑" if (pct_day or 0) > 0 else "↓" if (pct_day or 0) < 0 else "→"
-        lines.append(f"• {sym}: {arrow} ({fmt_pct(pct_day)})")
-    # สรุปโทนเมื่อเทียบสัญญาณ
-    await update.message.reply_text("\n".join(lines))
+    info = []
+    try:
+        for t in bench:
+            bars = await poly.daily_bars(t, days=3)
+            if len(bars) < 2:
+                info.append((t, "—"))
+                continue
+            chg = (bars[-1]["c"] - bars[-2]["c"]) / bars[-2]["c"] * 100.0
+            info.append((t, fmt_pct(chg)))
 
+        lines = [f"• {t}: {p}" for t, p in info]
+        summary = "ขาขึ้นอ่อน ๆ" if sum([(1 if "↑" in p else -1) for _, p in info]) > 0 else "โมเมนตัมกลางๆ"
+        msg = "📈 *Outlook วันนี้:*\n" + "\n".join(lines) + f"\nสรุปโมเมนตัม: {summary}"
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await update.message.reply_text(f"เกิดข้อผิดพลาดคำนวณ outlook: {e}")
 
-async def cmd_picks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def cmd_picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /picks                -> ใช้ DEFAULT_PICKS (หรือ ENV PICKS)
-    /picks AAPL NVDA     -> รายชื่อเอง
-    /picks auto          -> ให้บอทคัด Top 3 จาก universe
+    Swing Picks (สุ่มจาก universe แล้วกรอง):
+      - ราคา 5–200
+      - RSI 45–65 (โซนกำลังก่อตัว)
+      - ATR/Price ระดับปานกลาง (ไม่ผันผวนจัด)
+    ส่งคืน ~3 ตัวอย่างน้อย
     """
-    args = parse_symbols_from_args(context.args or [])
-    if len(args) == 1 and args[0] == "AUTO":
-        picks = await choose_dynamic_picks(3)
+    try:
+        universe = await _pick_universe()
+        candidates: List[Dict[str, Any]] = []
+
+        sem = asyncio.Semaphore(6)
+        async def worker(sym):
+            async with sem:
+                sig = await _compute_signal_for(sym)
+                if not sig or sig["rsi"] is None:
+                    return
+                price = sig["close"]
+                atr = sig["atr"] or 0.0
+                atr_pct = (atr / price * 100.0) if price else 0.0
+                if 5 <= price <= 200 and 45 <= sig["rsi"] <= 65 and 0.5 <= atr_pct <= 5.0:
+                    candidates.append(sig)
+
+        await asyncio.gather(*[worker(t) for t in universe])
+
+        random.shuffle(candidates)
+        picks = candidates[:3] if candidates else []
+
         if not picks:
-            picks = DEFAULT_PICKS  # fallback
-        header = "🧾 Picks (auto จากสแกน)"
-    elif args:
-        picks = args
-        header = "🧾 Picks (ผู้ใช้กำหนด)"
-    else:
-        picks = DEFAULT_PICKS
-        header = "🧾 Picks (ค่าเริ่มต้น)"
+            await update.message.reply_text("⚠️ Picks: ข้อมูลไม่พร้อม/ไม่เข้าเงื่อนไข ลองใหม่อีกครั้งภายหลัง")
+            return
 
-    quotes = await yf_quote(picks)
-    lines = [header]
+        lines = []
+        for p in picks:
+            lines.append(f"• {p['ticker']}: close {p['close']:.2f} | RSI {p['rsi']:.0f} | Δ {p['chg']:.2f}%")
 
-    for sym in picks:
-        q = quotes.get(sym)
-        if not q:
-            lines.append(f"⚠️ {sym}: ข้อมูลไม่พร้อม")
-            continue
+        msg = "🧾 *Picks (รายละเอียด)*\n" + "\n".join(lines)
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await update.message.reply_text(f"เกิดข้อผิดพลาดคำนวณ picks: {e}")
 
-        price = q.get("regularMarketPrice")
-        chg = q.get("regularMarketChangePercent")
-        vol = q.get("regularMarketVolume")
-        avg_vol = q.get("averageDailyVolume3Month")
-        mcap = q.get("marketCap")
-        pe = q.get("trailingPE")
-
-        _, closes = await yf_chart(sym)
-        if len(closes) < 50:
-            lines.append(f"⚠️ {sym}: ข้อมูลไม่พร้อม")
-            continue
-
-        sm20 = sma(closes, 20)
-        sm50 = sma(closes, 50)
-        rsi = rsi14(closes)
-
-        trend = "⬆️" if (sm20 and sm50 and sm20 > sm50) else "⬇️" if (sm20 and sm50 and sm20 < sm50) else "➡️"
-        bias = (
-            "Bullish" if (closes[-1] > (sm50 or closes[-1]) and (rsi or 50) >= 55) else
-            "Bearish" if (closes[-1] < (sm50 or closes[-1]) and (rsi or 50) <= 45) else
-            "Neutral"
-        )
-
-        lines.append(
-            f"• {sym}: {fmt_num(price)} ({fmt_pct(chg)}) {trend} {bias}\n"
-            f"   RSI14: {fmt_num(rsi)} | SMA20/50: {fmt_num(sm20)}/{fmt_num(sm50)}\n"
-            f"   Vol: {vol:,} (Avg: {avg_vol:,}) | MCap: {market_cap_str(mcap)} | PE: {fmt_num(pe,2)}"
-        )
-
-    if not args:
-        lines.append("\n💡 `/picks auto` ให้บอทคัดเอง, หรือ `/picks AAPL NVDA TSLA` ระบุเอง")
-
-    await update.message.reply_text("\n".join(lines))
-
-
-# -----------------------------
-# Healthcheck (aiohttp)
-# -----------------------------
-async def health(_request: web.Request) -> web.Response:
+# =========================================================
+# Health server (จำเป็นกับ Render)
+# =========================================================
+async def handle_health(request):
     return web.Response(
-        text=f"✅ Bot is running – {datetime.utcnow().isoformat()}Z",
+        text=f"✅ Bot is running — {datetime.utcnow().isoformat()}",
         content_type="text/plain"
     )
 
-
-# -----------------------------
-# Runner
-# -----------------------------
-async def run_polling(app: Application) -> None:
-    log.info("Starting Telegram bot (polling mode)")
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
-    # keep running
-    try:
-        while True:
-            await asyncio.sleep(3600)
-    finally:
-        await app.updater.stop()
-        await app.stop()
-
-
-async def run_webhook(app: Application) -> None:
-    log.info("Starting Flask + Telegram (webhook mode)")
-    if not PUBLIC_URL:
-        raise RuntimeError("PUBLIC_URL env required in webhook mode")
-
-    # aiohttp app
-    web_app = web.Application()
-    web_app.router.add_get("/", health)
-
-    # hook PTB to aiohttp
-    await app.initialize()
-    await app.start()
-
-    # build webhook URL
-    webhook_url = f"{PUBLIC_URL}{WEBHOOK_PATH}"
-    await app.bot.set_webhook(url=webhook_url, drop_pending_updates=True)
-
-    # mount telegram webhook handler
-    app.webhook_app = web_app
-    app.webhook_path = WEBHOOK_PATH
-    await app.start_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=WEBHOOK_PATH,
-        webhook_url=webhook_url,
-        drop_pending_updates=True,
-    )
-
-    runner = web.AppRunner(web_app)
+async def start_services():
+    # Health server
+    app = web.Application()
+    app.add_routes([web.get("/", handle_health)])
+    runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    log.info("HTTP server started on 0.0.0.0:%s", PORT)
 
-    try:
-        while True:
-            await asyncio.sleep(3600)
-    finally:
-        await app.stop()
-        await runner.cleanup()
-
-
-def build_application() -> Application:
-    if not BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is required")
-
-    application = (
-        ApplicationBuilder()
-        .token(BOT_TOKEN)
-        .concurrent_updates(True)  # allow concurrency
-        .build()
-    )
+    # Telegram (Polling)
+    application = Application.builder().token(BOT_TOKEN).build()
 
     application.add_handler(CommandHandler("ping", cmd_ping))
     application.add_handler(CommandHandler("movers", cmd_movers))
@@ -607,31 +341,26 @@ def build_application() -> Application:
     application.add_handler(CommandHandler("outlook", cmd_outlook))
     application.add_handler(CommandHandler("picks", cmd_picks))
 
-    return application
+    # run_polling ไม่ปิด loop (close_loop=False) เพื่อใช้ร่วมกับ aiohttp ได้
+    await application.run_polling(close_loop=False, allowed_updates=Update.ALL_TYPES)
 
+async def on_shutdown():
+    await poly.close()
 
-async def main_async() -> None:
-    application = build_application()
-    if MODE == "polling":
-        await run_polling(application)
-    else:
-        await run_webhook(application)
-
-
-def main() -> None:
+def main():
     try:
-        asyncio.get_event_loop().run_until_complete(main_async())
+        asyncio.get_event_loop().run_until_complete(start_services())
     except RuntimeError:
-        # already running loop (Render บางช่วง)
+        # fallback เมื่อ event loop “กำลังวิ่งอยู่”
         loop = asyncio.get_event_loop()
-        loop.create_task(main_async())
+        loop.create_task(start_services())
         loop.run_forever()
-    finally:
-        # close http session
-        if _http_session and not _http_session.closed:
-            loop = asyncio.get_event_loop()
-            loop.run_until_complete(_http_session.close())
-
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        try:
+            asyncio.get_event_loop().run_until_complete(on_shutdown())
+        except Exception:
+            pass
