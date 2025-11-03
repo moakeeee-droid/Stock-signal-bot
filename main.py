@@ -1,298 +1,270 @@
+# main.py  (v3.3 — Polygon + /fundamentals)
 import os
 import asyncio
 import random
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Any, Optional
-
-from aiohttp import web, ClientSession, ClientTimeout
+from aiohttp import web, ClientSession
 from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
-from telegram.ext import (
-    Application, CommandHandler, ContextTypes
-)
 
-# =========================================================
-# CONFIG
-# =========================================================
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-POLYGON_API_KEY = os.environ.get("POLYGON_API_KEY", "")
-PORT = int(os.environ.get("PORT", "10000"))
+# ====== CONFIG ======
+BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "")
+PORT = int(os.getenv("PORT", "10000"))
 
-if not BOT_TOKEN:
-    raise RuntimeError("ENV BOT_TOKEN is required")
-if not POLYGON_API_KEY:
-    raise RuntimeError("ENV POLYGON_API_KEY is required")
+if not BOT_TOKEN or not POLYGON_API_KEY:
+    raise RuntimeError("❌ Missing BOT_TOKEN or POLYGON_API_KEY")
 
 POLY_BASE = "https://api.polygon.io"
-SNAP_GAINERS = f"{POLY_BASE}/v2/snapshot/locale/us/markets/stocks/gainers"
-SNAP_LOSERS = f"{POLY_BASE}/v2/snapshot/locale/us/markets/stocks/losers"
-SNAP_SINGLE = f"{POLY_BASE}/v2/snapshot/locale/us/markets/stocks/tickers"
-AGG_RANGE = f"{POLY_BASE}/v2/aggs/ticker"  # /{ticker}/range/{mult}/{timespan}/{from}/{to}
 
-
-# =========================================================
-# HELPERS
-# =========================================================
+# ====== HELPERS ======
 def fmt_pct(x: float) -> str:
     sign = "↑" if x >= 0 else "↓"
     return f"{sign} {abs(x):.2f}%"
 
-def rsi_from_closes(closes: List[float], period: int = 14) -> Optional[float]:
-    if len(closes) < period + 1:
-        return None
-    gains = []
-    losses = []
-    for i in range(1, period + 1):
-        diff = closes[-(i)] - closes[-(i+1)]
-        if diff >= 0:
-            gains.append(diff)
-        else:
-            losses.append(-diff)
-    avg_gain = sum(gains) / period if gains else 0.0
-    avg_loss = sum(losses) / period if losses else 0.0
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+def fmt_number(x: float) -> str:
+    if x >= 1e12:
+        return f"{x/1e12:.2f}T"
+    if x >= 1e9:
+        return f"{x/1e9:.2f}B"
+    if x >= 1e6:
+        return f"{x/1e6:.2f}M"
+    if x >= 1e3:
+        return f"{x/1e3:.2f}K"
+    return f"{x:.0f}"
 
-def atr_from_ohlc(hlc: List[Dict[str, float]], period: int = 14) -> Optional[float]:
-    if len(hlc) < period + 1:
-        return None
-    trs = []
-    prev_close = hlc[-(period+1)]["c"]
-    for i in range(period):
-        bar = hlc[-(i+1)]
-        high, low, close = bar["h"], bar["l"], bar["c"]
-        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
-        trs.append(tr)
-        prev_close = close
-    return sum(trs) / period if trs else None
+def safe_get(d: dict, *keys, default=None):
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict) or k not in cur:
+            return default
+        cur = cur[k]
+    return cur
 
-
-# =========================================================
-# POLYGON CLIENT
-# =========================================================
+# ====== POLYGON CLIENT ======
 class PolygonClient:
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.session: Optional[ClientSession] = None
+        self.session: ClientSession | None = None
 
     async def ensure(self):
         if self.session is None or self.session.closed:
-            self.session = ClientSession(timeout=ClientTimeout(total=20))
+            self.session = ClientSession()
 
-    async def close(self):
-        if self.session and not self.session.closed:
-            await self.session.close()
-
-    async def _get(self, url: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
+    async def get(self, endpoint: str, params=None):
         await self.ensure()
-        params = params.copy() if params else {}
-        params["apiKey"] = self.api_key
-        async with self.session.get(url, params=params) as r:
+        params = (params or {}) | {"apiKey": self.api_key}
+        async with self.session.get(f"{POLY_BASE}{endpoint}", params=params) as r:
             r.raise_for_status()
             return await r.json()
 
-    async def gainers(self) -> List[Dict[str, Any]]:
-        data = await self._get(SNAP_GAINERS)
-        return data.get("tickers", []) or data.get("results", []) or []
+    # --- Snapshots (top movers) ---
+    async def gainers(self):
+        data = await self.get("/v2/snapshot/locale/us/markets/stocks/gainers")
+        return data.get("tickers", [])
 
-    async def losers(self) -> List[Dict[str, Any]]:
-        data = await self._get(SNAP_LOSERS)
-        return data.get("tickers", []) or data.get("results", []) or []
+    async def losers(self):
+        data = await self.get("/v2/snapshot/locale/us/markets/stocks/losers")
+        return data.get("tickers", [])
 
-    async def daily_bars(self, ticker: str, days: int = 60) -> List[Dict[str, Any]]:
+    # --- Daily aggregates ---
+    async def daily_bars(self, ticker: str, days=30, asc=True):
         end = datetime.now(timezone.utc).date()
-        start = end - timedelta(days=days + 10)
-        url = f"{AGG_RANGE}/{ticker}/range/1/day/{start}/{end}"
-        data = await self._get(url, {"adjusted": "true", "sort": "asc", "limit": 5000})
-        results = data.get("results", []) or []
-        bars = []
-        for r in results:
-            bars.append({
-                "o": float(r["o"]),
-                "h": float(r["h"]),
-                "l": float(r["l"]),
-                "c": float(r["c"]),
-                "v": float(r.get("v", 0)),
-                "t": int(r["t"])
-            })
-        return bars
+        start = end - timedelta(days=days)
+        data = await self.get(
+            f"/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}",
+            {"adjusted": "true", "sort": "asc" if asc else "desc", "limit": 5000},
+        )
+        return data.get("results", [])
 
+    # --- Ticker details (reference) ---
+    async def ticker_details(self, ticker: str):
+        # v3 reference returns { results: {...} }
+        data = await self.get(f"/v3/reference/tickers/{ticker}")
+        return data.get("results", {}) if isinstance(data, dict) else {}
 
-# =========================================================
-# BOT COMMANDS
-# =========================================================
+    # --- Snapshot for a single ticker (price/volume today) ---
+    async def snapshot_ticker(self, ticker: str):
+        # Use "all tickers" snapshot then pick (works under free tier)
+        data = await self.get("/v2/snapshot/locale/us/markets/stocks/tickers", {"tickers": ticker})
+        tickers = data.get("tickers", [])
+        return tickers[0] if tickers else {}
+
 poly = PolygonClient(POLYGON_API_KEY)
 
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ====== COMMANDS ======
+async def cmd_ping(update: Update, _: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("pong 🏓")
 
-async def cmd_movers(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_movers(update: Update, _: ContextTypes.DEFAULT_TYPE):
     try:
         gainers = await poly.gainers()
         losers = await poly.losers()
-
-        top_g = [
-            ((x.get("ticker") or x.get("T")),
-             float(x.get("todaysChangePerc", x.get("todays_change_percent", 0.0))))
-            for x in gainers
-        ]
-        top_l = [
-            ((x.get("ticker") or x.get("T")),
-             float(x.get("todaysChangePerc", x.get("todays_change_percent", 0.0))))
-            for x in losers
-        ]
-
-        random.shuffle(top_g)
-        random.shuffle(top_l)
-        g_show = top_g[:3]
-        l_show = top_l[:3]
-
-        g_txt = ", ".join([f"{t} ({fmt_pct(p)})" for t, p in g_show]) if g_show else "—"
-        l_txt = ", ".join([f"{t} ({fmt_pct(p)})" for t, p in l_show]) if l_show else "—"
-
-        msg = (
-            "📊 *Movers (จากชุดสแกน)*\n"
-            f"↑ Gainers: {g_txt}\n"
-            f"↓ Losers: {l_txt}"
-        )
+        top_g = [f"{x['ticker']} ({fmt_pct(x.get('todaysChangePerc', 0))})" for x in gainers[:3]]
+        top_l = [f"{x['ticker']} ({fmt_pct(x.get('todaysChangePerc', 0))})" for x in losers[:3]]
+        msg = "📊 *Movers (Polygon)*\n" + \
+              "↑ " + ", ".join(top_g) + "\n" + \
+              "↓ " + ", ".join(top_l)
         await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
-        await update.message.reply_text(f"เกิดข้อผิดพลาดดึง movers: {e}")
+        await update.message.reply_text(f"⚠️ Error: {e}")
 
-async def _compute_signal_for(ticker: str) -> Optional[Dict[str, Any]]:
-    bars = await poly.daily_bars(ticker, days=120)
-    if len(bars) < 20:
-        return None
-
-    closes = [b["c"] for b in bars]
-    rsi = rsi_from_closes(closes, period=14)
-    hlc = [{"h": b["h"], "l": b["l"], "c": b["c"]} for b in bars]
-    atr = atr_from_ohlc(hlc, period=14)
-    last = bars[-1]
-    prev = bars[-2]
-    chg = (last["c"] - prev["c"]) / prev["c"] * 100.0
-    return {"ticker": ticker, "close": last["c"], "chg": chg, "rsi": rsi, "atr": atr}
-
-async def _pick_universe() -> List[str]:
-    g = await poly.gainers()
-    l = await poly.losers()
-    gg = [x.get("ticker") or x.get("T") for x in g if x.get("ticker") or x.get("T")]
-    ll = [x.get("ticker") or x.get("T") for x in l if x.get("ticker") or x.get("T")]
-    random.shuffle(gg)
-    random.shuffle(ll)
-    universe = gg[:10] + ll[:10]
-    random.shuffle(universe)
-    return list(dict.fromkeys(universe))
-
-async def cmd_signals(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_outlook(update: Update, _: ContextTypes.DEFAULT_TYPE):
     try:
-        universe = await _pick_universe()
-        results = []
-        sem = asyncio.Semaphore(6)
-        async def worker(sym):
-            async with sem:
-                sig = await _compute_signal_for(sym)
-                if sig:
-                    results.append(sig)
-        await asyncio.gather(*[worker(t) for t in universe])
-        strong_call = [r for r in results if (r["rsi"] and r["rsi"] > 60 and r["chg"] > 0.5)]
-        strong_put = [r for r in results if (r["rsi"] and r["rsi"] < 40 and r["chg"] < -0.5)]
-        msg = (
-            "🔮 *Signals (ชุดสแกน)*\n"
-            f"Strong CALL: {len(strong_call)} | Strong PUT: {len(strong_put)}\n"
-            f"(ตรวจกับ {len(results)} ตัวจากชุดสแกน)"
-        )
-        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-    except Exception as e:
-        await update.message.reply_text(f"เกิดข้อผิดพลาดคำนวณ signals: {e}")
-
-async def cmd_outlook(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bench = ["SPY", "QQQ", "IWM"]
-    info = []
-    try:
-        for t in bench:
+        benchmarks = ["SPY", "QQQ", "IWM"]
+        lines, score = [], 0
+        for t in benchmarks:
             bars = await poly.daily_bars(t, days=3)
             if len(bars) < 2:
-                info.append((t, "—"))
+                lines.append(f"• {t}: — (ไม่มีข้อมูล)")
                 continue
-            chg = (bars[-1]["c"] - bars[-2]["c"]) / bars[-2]["c"] * 100.0
-            info.append((t, fmt_pct(chg)))
-        lines = [f"• {t}: {p}" for t, p in info]
-        summary = "ขาขึ้นอ่อน ๆ" if sum([(1 if "↑" in p else -1) for _, p in info]) > 0 else "โมเมนตัมกลางๆ"
+            chg = (bars[-1]["c"] - bars[-2]["c"]) / bars[-2]["c"] * 100
+            lines.append(f"• {t}: {fmt_pct(chg)}")
+            score += 1 if chg >= 0 else -1
+        summary = "ขาขึ้นอ่อนๆ" if score > 0 else ("ขาลงอ่อนๆ" if score < 0 else "โมเมนตัมกลางๆ")
         msg = "📈 *Outlook วันนี้:*\n" + "\n".join(lines) + f"\nสรุปโมเมนตัม: {summary}"
         await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
-        await update.message.reply_text(f"เกิดข้อผิดพลาดคำนวณ outlook: {e}")
+        await update.message.reply_text(f"⚠️ Error: {e}")
 
-async def cmd_picks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cmd_signals(update: Update, _: ContextTypes.DEFAULT_TYPE):
     try:
-        universe = await _pick_universe()
-        candidates: List[Dict[str, Any]] = []
-        sem = asyncio.Semaphore(6)
-        async def worker(sym):
-            async with sem:
-                sig = await _compute_signal_for(sym)
-                if not sig or sig["rsi"] is None:
-                    return
-                price = sig["close"]
-                atr = sig["atr"] or 0.0
-                atr_pct = (atr / price * 100.0) if price else 0.0
-                if 5 <= price <= 200 and 45 <= sig["rsi"] <= 65 and 0.5 <= atr_pct <= 5.0:
-                    candidates.append(sig)
-        await asyncio.gather(*[worker(t) for t in universe])
-        random.shuffle(candidates)
-        picks = candidates[:3] if candidates else []
-        if not picks:
-            await update.message.reply_text("⚠️ Picks: ข้อมูลไม่พร้อม/ไม่เข้าเงื่อนไข ลองใหม่อีกครั้งภายหลัง")
-            return
-        lines = [f"• {p['ticker']}: close {p['close']:.2f} | RSI {p['rsi']:.0f} | Δ {p['chg']:.2f}%" for p in picks]
-        msg = "🧾 *Picks (รายละเอียด)*\n" + "\n".join(lines)
+        gainers = await poly.gainers()
+        losers = await poly.losers()
+        strong_call = len([x for x in gainers if x.get("todaysChangePerc", 0) > 2])
+        strong_put = len([x for x in losers if x.get("todaysChangePerc", 0) < -2])
+        msg = (
+            "🔮 *Signals (Polygon)*\n"
+            f"Strong CALL: {strong_call} | Strong PUT: {strong_put}\n"
+            f"(จาก snapshot ล่าสุด)"
+        )
         await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
     except Exception as e:
-        await update.message.reply_text(f"เกิดข้อผิดพลาดคำนวณ picks: {e}")
+        await update.message.reply_text(f"⚠️ Error: {e}")
 
+async def cmd_picks(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    try:
+        gainers = await poly.gainers()
+        random.shuffle(gainers)
+        picks = gainers[:3]
+        if not picks:
+            await update.message.reply_text("⚠️ ข้อมูลไม่พร้อม")
+            return
+        lines = [
+            f"• {p['ticker']}  ({fmt_pct(p.get('todaysChangePerc', 0))})  "
+            f"Vol: {fmt_number(p.get('volume', 0))}"
+            for p in picks
+        ]
+        msg = "🧾 *Picks (Polygon)*\n" + "\n".join(lines)
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Error: {e}")
 
-# =========================================================
-# HEALTHCHECK + MAIN LOOP
-# =========================================================
-async def handle_health(request):
-    return web.Response(text=f"✅ Bot is running — {datetime.utcnow().isoformat()}")
+async def cmd_fundamentals(update: Update, _: ContextTypes.DEFAULT_TYPE):
+    """
+    ใช้: /fundamentals TSLA
+    แสดงราคา/ปริมาณวันนี้ + 52W high/low + Avg Vol + Market Cap (ถ้ามี) + ข้อมูลบริษัท
+    """
+    try:
+        parts = (update.message.text or "").strip().split()
+        if len(parts) < 2:
+            await update.message.reply_text("พิมพ์แบบนี้นะครับ: `/fundamentals TSLA`", parse_mode=ParseMode.MARKDOWN)
+            return
+        ticker = parts[1].upper()
+
+        # ข้อมูลวันนี้
+        snap = await poly.snapshot_ticker(ticker)
+        todays_change_pct = snap.get("todaysChangePerc", 0.0)
+        day_c = safe_get(snap, "day", "c", default=None)
+        day_o = safe_get(snap, "day", "o", default=None)
+        day_h = safe_get(snap, "day", "h", default=None)
+        day_l = safe_get(snap, "day", "l", default=None)
+        day_v = safe_get(snap, "day", "v", default=None)
+
+        # ย้อนหลัง 365 วัน เพื่อ 52W hi/lo + Avg Volume (20 วันล่าสุด)
+        bars_1y = await poly.daily_bars(ticker, days=370, asc=True)
+        if bars_1y:
+            highs = [b["h"] for b in bars_1y]
+            lows = [b["l"] for b in bars_1y]
+            hi_52w = max(highs)
+            lo_52w = min(lows)
+        else:
+            hi_52w = lo_52w = None
+
+        last20 = bars_1y[-20:] if len(bars_1y) >= 1 else []
+        avg_vol_20 = sum(b.get("v", 0) for b in last20) / len(last20) if last20 else None
+
+        # รายละเอียดบริษัท (ถ้ามี)
+        info = await poly.ticker_details(ticker)
+        comp_name = info.get("name") or info.get("description") or ""
+        primary_exchange = info.get("primary_exchange") or info.get("primary_exchange_symbol") or ""
+        market_cap = info.get("market_cap")  # บางบัญชี/สัญลักษณ์อาจไม่มี
+
+        # สร้างข้อความ
+        lines = [f"📌 *{ticker}*  {comp_name}".strip()]
+        sub = []
+        if primary_exchange:
+            sub.append(primary_exchange)
+        if market_cap:
+            sub.append(f"MC: {fmt_number(float(market_cap))}")
+        if sub:
+            lines.append(" · " + " | ".join(sub))
+
+        # ราคา/ปริมาณวันนี้
+        if day_c is not None:
+            lines.append(f"• Today O/H/L/C: {day_o} / {day_h} / {day_l} / {day_c}")
+        if day_v is not None:
+            lines.append(f"• Volume (today): {fmt_number(day_v)}")
+        lines.append(f"• Change: {fmt_pct(float(todays_change_pct or 0))}")
+
+        # 52W & AvgVol
+        if hi_52w is not None and lo_52w is not None:
+            lines.append(f"• 52W Range: {lo_52w:.2f} – {hi_52w:.2f}")
+        if avg_vol_20 is not None:
+            lines.append(f"• Avg Vol (20d): {fmt_number(avg_vol_20)}")
+
+        msg = "\n".join(lines)
+        await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+    except Exception as e:
+        await update.message.reply_text(f"⚠️ Error: {e}")
+
+# ====== HEALTHCHECK + MAIN ======
+async def health(_request):
+    return web.Response(text=f"✅ Bot live {datetime.now(timezone.utc).isoformat()}")
 
 async def start_services():
+    # healthcheck server
     app = web.Application()
-    app.add_routes([web.get("/", handle_health)])
+    app.add_routes([web.get("/", health)])
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
+    try:
+        site = web.TCPSite(runner, "0.0.0.0", PORT)
+        await site.start()
+    except OSError as e:
+        print(f"⚠️ Port {PORT} already in use: {e}")
 
+    # telegram bot (polling)
     application = Application.builder().token(BOT_TOKEN).build()
     application.add_handler(CommandHandler("ping", cmd_ping))
     application.add_handler(CommandHandler("movers", cmd_movers))
     application.add_handler(CommandHandler("signals", cmd_signals))
     application.add_handler(CommandHandler("outlook", cmd_outlook))
     application.add_handler(CommandHandler("picks", cmd_picks))
+    application.add_handler(CommandHandler("fundamentals", cmd_fundamentals))
 
-    await application.run_polling(close_loop=False, allowed_updates=Update.ALL_TYPES)
-
-async def on_shutdown():
-    await poly.close()
+    print("🚀 Telegram bot started with Polygon API")
+    await application.run_polling(close_loop=False)
 
 def main():
     try:
-        asyncio.get_event_loop().run_until_complete(start_services())
+        asyncio.run(start_services())
     except RuntimeError:
-        loop = asyncio.get_event_loop()
-        loop.create_task(start_services())
-        loop.run_forever()
+        # fallback when loop already running
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.run_until_complete(start_services())
 
 if __name__ == "__main__":
-    try:
-        main()
-    finally:
-        try:
-            asyncio.get_event_loop().run_until_complete(on_shutdown())
-        except Exception:
-            pass
+    main()
